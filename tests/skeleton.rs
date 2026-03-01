@@ -4,6 +4,7 @@
 mod helpers;
 
 use helpers::{Collector, Echo};
+use rust_dst_db::config::DatabaseConfig;
 use rust_dst_db::sim::bus::MessageBus;
 use rust_dst_db::sim::fault::{FaultConfig, FaultInjector};
 use rust_dst_db::traits::message::{ActorId, Message};
@@ -11,7 +12,8 @@ use rust_dst_db::traits::message::{ActorId, Message};
 #[test]
 fn skeleton_boots_and_delivers_message() {
     let injector = FaultInjector::new(FaultConfig::none());
-    let mut bus = MessageBus::new(42, injector);
+    let cfg = DatabaseConfig::default();
+    let mut bus = MessageBus::new(42, injector, &cfg);
 
     let echo_id = ActorId(1);
     let collector_id = ActorId(2);
@@ -34,7 +36,8 @@ fn deterministic_replay_same_seed() {
     // Trace logs must be byte-identical.
     fn run_scenario(seed: u64) -> Vec<String> {
         let injector = FaultInjector::new(FaultConfig::none());
-        let mut bus = MessageBus::new(seed, injector);
+        let cfg = DatabaseConfig::default();
+        let mut bus = MessageBus::new(seed, injector, &cfg);
 
         let echo_id = ActorId(1);
         let collector_id = ActorId(2);
@@ -69,7 +72,8 @@ fn different_seeds_may_differ_under_faults() {
             ..FaultConfig::none()
         };
         let injector = FaultInjector::new(config);
-        let mut bus = MessageBus::new(seed, injector);
+        let cfg = DatabaseConfig::default();
+        let mut bus = MessageBus::new(seed, injector, &cfg);
 
         let echo_id = ActorId(1);
         let collector_id = ActorId(2);

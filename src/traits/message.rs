@@ -188,4 +188,82 @@ pub enum Message {
     TxnScan { txn_id: u64, start: Option<Vec<u8>>, end: Option<Vec<u8>> },
     /// Transaction scan result.
     TxnScanResult { txn_id: u64, entries: Vec<(Vec<u8>, Vec<u8>)> },
+
+    // --- Backup messages ---
+    /// Initiate a backup. BackupManager coordinates flush → fsync → capture.
+    BackupCreate,
+    /// Backup completed; contains the checkpoint.
+    BackupCreated { checkpoint_id: u64 },
+    /// Restore from a previously captured checkpoint.
+    BackupRestore { checkpoint_id: u64 },
+    /// Restore completed.
+    BackupRestored,
+    /// Backup or restore failed.
+    BackupErr { reason: String },
+    /// Internal: BackupManager requests full file data from disk.
+    BackupReadDisk { file_id: u64 },
+
+    // --- Network messages ---
+    /// Send data to another node.
+    NetSend { conn_id: u64, to_node: String, data: Vec<u8> },
+    /// NetSend acknowledged.
+    NetSendOk { conn_id: u64, to_node: String },
+    /// NetSend failed.
+    NetSendErr { conn_id: u64, to_node: String, reason: String },
+    /// Data received from another node.
+    NetRecv { conn_id: u64, from_node: String, data: Vec<u8> },
+    /// Request a connection to a node.
+    NetConnect { conn_id: u64, node: String },
+    /// Connection established.
+    NetConnected { conn_id: u64, node: String },
+    /// Connection lost or refused.
+    NetDisconnected { conn_id: u64, node: String },
+    /// Inject a partition between two nodes (simulation control).
+    NetPartition { node_a: String, node_b: String },
+    /// Heal a partition between two nodes (simulation control).
+    NetHeal { node_a: String, node_b: String },
+
+    // --- Raft: Leader Election ---
+    RaftRequestVote {
+        term: u64,
+        candidate_id: String,
+        last_log_index: u64,
+        last_log_term: u64,
+    },
+    RaftVoteGranted { term: u64, from: String },
+    RaftVoteDenied  { term: u64, from: String },
+
+    // --- Raft: Log Replication (also heartbeat when entries is empty) ---
+    RaftAppendEntries {
+        term: u64,
+        leader_id: String,
+        prev_log_index: u64,
+        prev_log_term: u64,
+        /// (term, serialized command) pairs.
+        entries: Vec<(u64, Vec<u8>)>,
+        leader_commit: u64,
+    },
+    RaftAppendEntriesOk  { term: u64, from: String, match_index: u64 },
+    RaftAppendEntriesErr { term: u64, from: String, reason: String },
+
+    // --- Raft: Snapshot Install ---
+    RaftInstallSnapshot {
+        term: u64,
+        leader_id: String,
+        last_included_index: u64,
+        last_included_term: u64,
+        /// Encoded Checkpoint bytes.
+        data: Vec<u8>,
+    },
+    RaftInstallSnapshotOk { term: u64, from: String },
+
+    // --- Raft: Client-facing ---
+    /// Leader notifies client that a command reached consensus.
+    RaftCommandCommitted { client_seq: u64, result: Vec<u8> },
+    /// Non-leader redirects client to current leader.
+    RaftRedirect { leader_id: Option<String> },
+
+    // --- Raft: Internal ---
+    /// RaftServer → local TransactionManager: apply committed command.
+    RaftApplyCommand { index: u64, data: Vec<u8> },
 }

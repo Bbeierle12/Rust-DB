@@ -3,6 +3,7 @@
 mod helpers;
 
 use helpers::Collector;
+use rust_dst_db::config::DatabaseConfig;
 use rust_dst_db::sim::bus::MessageBus;
 use rust_dst_db::sim::clock::SimClock;
 use rust_dst_db::sim::fault::{FaultAction, FaultConfig, FaultInjector};
@@ -221,7 +222,8 @@ fn fault_injector_injects_fsync_errors() {
 #[test]
 fn bus_two_actors_communicate() {
     let injector = FaultInjector::new(FaultConfig::none());
-    let mut bus = MessageBus::new(42, injector);
+    let cfg = DatabaseConfig::default();
+    let mut bus = MessageBus::new(42, injector, &cfg);
 
     let a_id = ActorId(1);
     let b_id = ActorId(2);
@@ -245,7 +247,8 @@ fn bus_two_actors_communicate() {
 #[test]
 fn bus_respects_delivery_delay() {
     let injector = FaultInjector::new(FaultConfig::none());
-    let mut bus = MessageBus::new(42, injector);
+    let cfg = DatabaseConfig::default();
+    let mut bus = MessageBus::new(42, injector, &cfg);
 
     let collector_id = ActorId(1);
     bus.register(Box::new(Collector::new(collector_id)));
@@ -271,7 +274,8 @@ fn bus_deterministic_delivery_order() {
     // Send multiple messages at the same tick from different senders.
     // Delivery order must be deterministic (sorted by from, then to).
     let injector = FaultInjector::new(FaultConfig::none());
-    let mut bus = MessageBus::new(42, injector);
+    let cfg = DatabaseConfig::default();
+    let mut bus = MessageBus::new(42, injector, &cfg);
 
     let collector_id = ActorId(100);
     bus.register(Box::new(Collector::new(collector_id)));

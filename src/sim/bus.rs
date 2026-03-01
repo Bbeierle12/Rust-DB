@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::config::DatabaseConfig;
 use crate::sim::clock::SimClock;
 use crate::sim::fault::{FaultAction, FaultInjector};
 use crate::sim::rng::SeededRng;
@@ -28,7 +29,7 @@ pub struct MessageBus {
 }
 
 impl MessageBus {
-    pub fn new(seed: u64, fault_injector: FaultInjector) -> Self {
+    pub fn new(seed: u64, fault_injector: FaultInjector, _cfg: &DatabaseConfig) -> Self {
         Self {
             clock: SimClock::new(),
             rng: SeededRng::new(seed),
@@ -124,7 +125,7 @@ impl MessageBus {
             }
         }
 
-        // Tick all actors.
+        // Tick all actors (may produce messages scheduled at `now`).
         let actor_ids: Vec<ActorId> = self.actors.keys().copied().collect();
         for id in actor_ids {
             if let Some(mut actor) = self.actors.remove(&id) {
@@ -133,6 +134,49 @@ impl MessageBus {
                 if let Some(msgs) = outgoing {
                     self.enqueue_outgoing(id, msgs);
                 }
+            }
+        }
+
+        // Second wave: process any messages that actor ticks just enqueued at `now`.
+        loop {
+            let envelopes = match self.queue.remove(&now) {
+                Some(mut e) => {
+                    e.sort();
+                    e
+                }
+                None => break,
+            };
+
+            for mut envelope in envelopes {
+                let action = self.fault_injector.maybe_fault(&mut envelope, &mut self.rng);
+                match action {
+                    FaultAction::Drop => {
+                        self.trace.push((
+                            now,
+                            envelope.from,
+                            envelope.to,
+                            format!("DROPPED: {:?}", envelope.message),
+                        ));
+                        continue;
+                    }
+                    FaultAction::Mutated | FaultAction::Pass => {}
+                }
+
+                let msg_debug = format!("{:?}", envelope.message);
+                self.trace.push((now, envelope.from, envelope.to, msg_debug));
+
+                if let Some(actor) = self.actors.remove(&envelope.to) {
+                    let mut actor = actor;
+                    let outgoing = actor.receive(envelope.from, envelope.message);
+                    let actor_id = actor.id();
+                    self.actors.insert(actor_id, actor);
+                    if let Some(msgs) = outgoing {
+                        self.enqueue_outgoing(actor_id, msgs);
+                    }
+                }
+
+                delivered += 1;
+                self.delivered_count += 1;
             }
         }
 

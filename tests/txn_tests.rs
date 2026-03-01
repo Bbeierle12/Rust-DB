@@ -10,6 +10,7 @@
 mod helpers;
 
 use helpers::Collector;
+use rust_dst_db::config::DatabaseConfig;
 use rust_dst_db::sim::bus::MessageBus;
 use rust_dst_db::sim::disk::SimDisk;
 use rust_dst_db::sim::fault::{FaultConfig, FaultInjector};
@@ -30,21 +31,12 @@ const WAL_FILE_ID: u64 = 0;
 
 fn setup_txn(seed: u64, fault_config: FaultConfig) -> MessageBus {
     let injector = FaultInjector::new(fault_config);
-    let mut bus = MessageBus::new(seed, injector);
+    let cfg = DatabaseConfig::default();
+    let mut bus = MessageBus::new(seed, injector, &cfg);
 
-    bus.register(Box::new(SimDisk::new(DISK_ID, false)));
-    bus.register(Box::new(WalWriter::new(
-        WAL_WRITER_ID,
-        DISK_ID,
-        TXN_MGR_ID,
-        WAL_FILE_ID,
-    )));
-    bus.register(Box::new(WalReader::new(
-        WAL_READER_ID,
-        DISK_ID,
-        CLIENT_ID,
-        WAL_FILE_ID,
-    )));
+    bus.register(Box::new(SimDisk::new(DISK_ID, false, &cfg)));
+    bus.register(Box::new(WalWriter::new(WAL_WRITER_ID, DISK_ID, TXN_MGR_ID, &cfg)));
+    bus.register(Box::new(WalReader::new(WAL_READER_ID, DISK_ID, CLIENT_ID, &cfg)));
     bus.register(Box::new(TransactionManager::new(TXN_MGR_ID, WAL_WRITER_ID)));
     bus.register(Box::new(Collector::new(CLIENT_ID)));
     bus.register(Box::new(Collector::new(CLIENT2_ID)));
@@ -779,7 +771,8 @@ fn crash_recovery_via_wal_replay() {
 
     // Set up bus for verification.
     let injector = FaultInjector::new(FaultConfig::none());
-    let mut bus2 = MessageBus::new(42, injector);
+    let cfg2 = DatabaseConfig::default();
+    let mut bus2 = MessageBus::new(42, injector, &cfg2);
     bus2.register(Box::new(fresh_mgr));
     bus2.register(Box::new(Collector::new(CLIENT_ID)));
 
@@ -842,15 +835,11 @@ fn randomized_concurrent_transactions() {
     // controlled by the bus. Verify consistency after all commit/abort.
     fn run_scenario(seed: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
         let injector = FaultInjector::new(FaultConfig::none());
-        let mut bus = MessageBus::new(seed, injector);
+        let cfg = DatabaseConfig::default();
+        let mut bus = MessageBus::new(seed, injector, &cfg);
 
-        bus.register(Box::new(SimDisk::new(DISK_ID, false)));
-        bus.register(Box::new(WalWriter::new(
-            WAL_WRITER_ID,
-            DISK_ID,
-            TXN_MGR_ID,
-            WAL_FILE_ID,
-        )));
+        bus.register(Box::new(SimDisk::new(DISK_ID, false, &cfg)));
+        bus.register(Box::new(WalWriter::new(WAL_WRITER_ID, DISK_ID, TXN_MGR_ID, &cfg)));
         bus.register(Box::new(TransactionManager::new(TXN_MGR_ID, WAL_WRITER_ID)));
 
         // Create 5 client collectors.

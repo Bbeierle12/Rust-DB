@@ -1,4 +1,4 @@
-use crate::config;
+use crate::config::DatabaseConfig;
 use crate::traits::message::{ActorId, Destination, Message};
 use crate::traits::state_machine::StateMachine;
 
@@ -12,6 +12,7 @@ pub struct WalReader {
     disk_actor: ActorId,
     reply_to: ActorId,
     file_id: u64,
+    wal_header_size: usize,
     /// State for progressive read-back.
     read_state: ReadState,
 }
@@ -24,24 +25,25 @@ enum ReadState {
 }
 
 impl WalReader {
-    pub fn new(id: ActorId, disk_actor: ActorId, reply_to: ActorId, file_id: u64) -> Self {
+    pub fn new(id: ActorId, disk_actor: ActorId, reply_to: ActorId, cfg: &DatabaseConfig) -> Self {
         Self {
             id,
             disk_actor,
             reply_to,
-            file_id,
+            file_id: cfg.wal_file_id,
+            wal_header_size: cfg.wal_header_size,
             read_state: ReadState::Idle,
         }
     }
 
     /// Parse WAL records from raw bytes.
     /// Returns (lsn, payload) pairs. Stops at first corruption.
-    fn parse_records(data: &[u8]) -> Vec<(u64, Vec<u8>)> {
+    fn parse_records(data: &[u8], header_size: usize) -> Vec<(u64, Vec<u8>)> {
         let mut records = Vec::new();
         let mut pos = 0;
         let mut lsn = 0u64;
 
-        while pos + config::WAL_HEADER_SIZE <= data.len() {
+        while pos + header_size <= data.len() {
             // Read length.
             let len_bytes: [u8; 4] = data[pos..pos + 4].try_into().unwrap();
             let payload_len = u32::from_le_bytes(len_bytes) as usize;
@@ -51,7 +53,7 @@ impl WalReader {
             let stored_crc = u32::from_le_bytes(crc_bytes);
 
             // Bounds check.
-            let payload_start = pos + config::WAL_HEADER_SIZE;
+            let payload_start = pos + header_size;
             let payload_end = payload_start + payload_len;
             if payload_end > data.len() {
                 // Truncated record — stop here.
@@ -103,7 +105,7 @@ impl StateMachine for WalReader {
                 data,
             } if file_id == self.file_id => {
                 self.read_state = ReadState::Idle;
-                let records = Self::parse_records(&data);
+                let records = Self::parse_records(&data, self.wal_header_size);
                 Some(vec![(
                     Message::WalRecords { records },
                     Destination {

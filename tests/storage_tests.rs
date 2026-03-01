@@ -4,7 +4,7 @@
 mod helpers;
 
 use helpers::Collector;
-use rust_dst_db::config;
+use rust_dst_db::config::DatabaseConfig;
 use rust_dst_db::sim::bus::MessageBus;
 use rust_dst_db::sim::disk::SimDisk;
 use rust_dst_db::sim::fault::{FaultConfig, FaultInjector};
@@ -33,34 +33,19 @@ fn setup_storage(
     buf_pool_capacity: usize,
 ) -> MessageBus {
     let injector = FaultInjector::new(fault_config);
-    let mut bus = MessageBus::new(seed, injector);
+    let cfg = DatabaseConfig {
+        btree_max_leaf_entries: max_leaf,
+        btree_max_internal_keys: max_internal,
+        buffer_pool_pages: buf_pool_capacity,
+        ..DatabaseConfig::default()
+    };
+    let mut bus = MessageBus::new(seed, injector, &cfg);
 
-    bus.register(Box::new(SimDisk::new(DISK_ID, false)));
-    bus.register(Box::new(WalWriter::new(
-        WAL_WRITER_ID,
-        DISK_ID,
-        BTREE_ID,
-        WAL_FILE_ID,
-    )));
-    bus.register(Box::new(WalReader::new(
-        WAL_READER_ID,
-        DISK_ID,
-        CLIENT_ID,
-        WAL_FILE_ID,
-    )));
-    bus.register(Box::new(BufferPool::new(
-        BUF_POOL_ID,
-        DISK_ID,
-        config::BTREE_DATA_FILE_ID,
-        buf_pool_capacity,
-    )));
-    bus.register(Box::new(BTreeEngine::with_limits(
-        BTREE_ID,
-        BUF_POOL_ID,
-        WAL_WRITER_ID,
-        max_leaf,
-        max_internal,
-    )));
+    bus.register(Box::new(SimDisk::new(DISK_ID, false, &cfg)));
+    bus.register(Box::new(WalWriter::new(WAL_WRITER_ID, DISK_ID, BTREE_ID, &cfg)));
+    bus.register(Box::new(WalReader::new(WAL_READER_ID, DISK_ID, CLIENT_ID, &cfg)));
+    bus.register(Box::new(BufferPool::new(BUF_POOL_ID, DISK_ID, &cfg)));
+    bus.register(Box::new(BTreeEngine::new(BTREE_ID, BUF_POOL_ID, WAL_WRITER_ID, &cfg)));
     bus.register(Box::new(Collector::new(CLIENT_ID)));
 
     bus
@@ -601,16 +586,12 @@ fn btree_crash_recovery_via_wal() {
 
     // Phase 3: Create fresh B-tree and replay WAL.
     let injector = FaultInjector::new(FaultConfig::none());
-    let mut bus2 = MessageBus::new(42, injector);
+    let cfg2 = DatabaseConfig { btree_max_leaf_entries: 4, btree_max_internal_keys: 4, buffer_pool_pages: 64, ..DatabaseConfig::default() };
+    let mut bus2 = MessageBus::new(42, injector, &cfg2);
 
-    bus2.register(Box::new(SimDisk::new(DISK_ID, false)));
-    bus2.register(Box::new(BufferPool::new(
-        BUF_POOL_ID,
-        DISK_ID,
-        config::BTREE_DATA_FILE_ID,
-        64,
-    )));
-    let mut fresh_btree = BTreeEngine::with_limits(BTREE_ID, BUF_POOL_ID, WAL_WRITER_ID, 4, 4);
+    bus2.register(Box::new(SimDisk::new(DISK_ID, false, &cfg2)));
+    bus2.register(Box::new(BufferPool::new(BUF_POOL_ID, DISK_ID, &cfg2)));
+    let mut fresh_btree = BTreeEngine::new(BTREE_ID, BUF_POOL_ID, WAL_WRITER_ID, &cfg2);
     fresh_btree.replay_wal(&records);
     bus2.register(Box::new(fresh_btree));
     bus2.register(Box::new(Collector::new(CLIENT_ID)));
@@ -698,12 +679,14 @@ fn btree_crash_recovery_with_deletes() {
     };
 
     // Replay on fresh tree.
-    let mut fresh = BTreeEngine::with_limits(BTREE_ID, BUF_POOL_ID, WAL_WRITER_ID, 4, 4);
+    let cfg_fresh = DatabaseConfig { btree_max_leaf_entries: 4, btree_max_internal_keys: 4, ..DatabaseConfig::default() };
+    let mut fresh = BTreeEngine::new(BTREE_ID, BUF_POOL_ID, WAL_WRITER_ID, &cfg_fresh);
     fresh.replay_wal(&records);
 
     // Set up bus for verification.
     let injector = FaultInjector::new(FaultConfig::none());
-    let mut bus2 = MessageBus::new(42, injector);
+    let cfg2 = DatabaseConfig::default();
+    let mut bus2 = MessageBus::new(42, injector, &cfg2);
     bus2.register(Box::new(fresh));
     bus2.register(Box::new(Collector::new(CLIENT_ID)));
 

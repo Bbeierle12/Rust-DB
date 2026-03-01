@@ -1,4 +1,10 @@
+pub mod backup;
 pub mod config;
+pub mod net;
+#[cfg(feature = "python")]
+pub mod python;
+pub mod query;
+pub mod raft;
 pub mod sim;
 pub mod storage;
 pub mod traits;

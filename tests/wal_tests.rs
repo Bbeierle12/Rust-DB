@@ -4,6 +4,7 @@
 mod helpers;
 
 use helpers::Collector;
+use rust_dst_db::config::DatabaseConfig;
 use rust_dst_db::sim::bus::MessageBus;
 use rust_dst_db::sim::disk::SimDisk;
 use rust_dst_db::sim::fault::{FaultConfig, FaultInjector};
@@ -20,15 +21,12 @@ const WAL_FILE_ID: u64 = 0;
 /// Helper: set up a bus with disk, WAL writer, WAL reader, and client collector.
 fn setup_bus(seed: u64, fault_config: FaultConfig, buffered_disk: bool) -> MessageBus {
     let injector = FaultInjector::new(fault_config);
-    let mut bus = MessageBus::new(seed, injector);
+    let cfg = DatabaseConfig::default();
+    let mut bus = MessageBus::new(seed, injector, &cfg);
 
-    bus.register(Box::new(SimDisk::new(DISK_ID, buffered_disk)));
-    bus.register(Box::new(WalWriter::new(
-        WRITER_ID, DISK_ID, CLIENT_ID, WAL_FILE_ID,
-    )));
-    bus.register(Box::new(WalReader::new(
-        READER_ID, DISK_ID, CLIENT_ID, WAL_FILE_ID,
-    )));
+    bus.register(Box::new(SimDisk::new(DISK_ID, buffered_disk, &cfg)));
+    bus.register(Box::new(WalWriter::new(WRITER_ID, DISK_ID, CLIENT_ID, &cfg)));
+    bus.register(Box::new(WalReader::new(READER_ID, DISK_ID, CLIENT_ID, &cfg)));
     bus.register(Box::new(Collector::new(CLIENT_ID)));
 
     bus

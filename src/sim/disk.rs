@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::config;
+use crate::config::DatabaseConfig;
 use crate::traits::message::{ActorId, Destination, Message};
 use crate::traits::state_machine::StateMachine;
 
@@ -19,15 +19,21 @@ pub struct SimDisk {
     /// Whether to buffer writes (true) or apply immediately (false).
     /// When true, data is only visible after fsync.
     buffered: bool,
+    read_latency: u64,
+    write_latency: u64,
+    fsync_latency: u64,
 }
 
 impl SimDisk {
-    pub fn new(id: ActorId, buffered: bool) -> Self {
+    pub fn new(id: ActorId, buffered: bool, cfg: &DatabaseConfig) -> Self {
         Self {
             id,
             files: BTreeMap::new(),
             write_buffer: BTreeMap::new(),
             buffered,
+            read_latency: cfg.sim_disk_read_latency_ticks,
+            write_latency: cfg.sim_disk_write_latency_ticks,
+            fsync_latency: cfg.sim_fsync_latency_ticks,
         }
     }
 
@@ -75,7 +81,7 @@ impl StateMachine for SimDisk {
                     Message::DiskWriteOk { file_id, offset },
                     Destination {
                         actor: from,
-                        delay: config::SIM_DISK_WRITE_LATENCY_TICKS,
+                        delay: self.write_latency,
                     },
                 )])
             }
@@ -104,7 +110,7 @@ impl StateMachine for SimDisk {
                     },
                     Destination {
                         actor: from,
-                        delay: config::SIM_DISK_READ_LATENCY_TICKS,
+                        delay: self.read_latency,
                     },
                 )])
             }
@@ -119,7 +125,7 @@ impl StateMachine for SimDisk {
                     Message::DiskFsyncOk { file_id },
                     Destination {
                         actor: from,
-                        delay: config::SIM_FSYNC_LATENCY_TICKS,
+                        delay: self.fsync_latency,
                     },
                 )])
             }

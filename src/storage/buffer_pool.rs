@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::config;
+use crate::config::{self, DatabaseConfig};
 use crate::traits::message::{ActorId, Destination, Message};
 use crate::traits::state_machine::StateMachine;
 
@@ -55,12 +55,12 @@ pub struct BufferPool {
 }
 
 impl BufferPool {
-    pub fn new(id: ActorId, disk_actor: ActorId, file_id: u64, capacity: usize) -> Self {
+    pub fn new(id: ActorId, disk_actor: ActorId, cfg: &DatabaseConfig) -> Self {
         Self {
             id,
             disk_actor,
-            file_id,
-            capacity,
+            file_id: cfg.btree_data_file_id,
+            capacity: cfg.buffer_pool_pages,
             cache: BTreeMap::new(),
             now: 0,
             pending_reads: BTreeMap::new(),

@@ -1,4 +1,4 @@
-use crate::config;
+use crate::config::DatabaseConfig;
 use crate::traits::message::{ActorId, Destination, Message};
 use crate::traits::state_machine::StateMachine;
 
@@ -17,6 +17,7 @@ pub struct WalWriter {
     disk_actor: ActorId,
     reply_to: ActorId,
     file_id: u64,
+    wal_header_size: usize,
     /// Current write offset in the WAL file.
     offset: u64,
     /// Next LSN to assign.
@@ -28,28 +29,32 @@ pub struct WalWriter {
     pending_writes: Vec<(u64, u64)>,
     /// Whether we're waiting for an fsync response.
     fsync_pending: bool,
+    /// Who requested the current fsync (may differ from reply_to).
+    fsync_requester: Option<ActorId>,
 }
 
 impl WalWriter {
-    pub fn new(id: ActorId, disk_actor: ActorId, reply_to: ActorId, file_id: u64) -> Self {
+    pub fn new(id: ActorId, disk_actor: ActorId, reply_to: ActorId, cfg: &DatabaseConfig) -> Self {
         Self {
             id,
             disk_actor,
             reply_to,
-            file_id,
+            file_id: cfg.wal_file_id,
+            wal_header_size: cfg.wal_header_size,
             offset: 0,
             next_lsn: 0,
             fsynced_lsn: 0,
             pending_writes: Vec::new(),
             fsync_pending: false,
+            fsync_requester: None,
         }
     }
 
     /// Encode a WAL record: [length: u32][crc32: u32][payload].
-    fn encode_record(data: &[u8]) -> Vec<u8> {
+    fn encode_record(data: &[u8], header_size: usize) -> Vec<u8> {
         let len = data.len() as u32;
         let crc = crc32fast::hash(data);
-        let mut record = Vec::with_capacity(config::WAL_HEADER_SIZE + data.len());
+        let mut record = Vec::with_capacity(header_size + data.len());
         record.extend_from_slice(&len.to_le_bytes());
         record.extend_from_slice(&crc.to_le_bytes());
         record.extend_from_slice(data);
@@ -71,12 +76,14 @@ impl StateMachine for WalWriter {
     }
 
     fn receive(&mut self, _from: ActorId, msg: Message) -> Option<Vec<(Message, Destination)>> {
+        // Alias so we can use `_from` in handlers.
+        let _from = _from;
         match msg {
             Message::WalAppend { data } => {
                 let lsn = self.next_lsn;
                 self.next_lsn += 1;
 
-                let record = Self::encode_record(&data);
+                let record = Self::encode_record(&data, self.wal_header_size);
                 let write_offset = self.offset;
                 self.offset += record.len() as u64;
 
@@ -126,6 +133,7 @@ impl StateMachine for WalWriter {
             }
             Message::WalFsync => {
                 self.fsync_pending = true;
+                self.fsync_requester = Some(_from);
                 Some(vec![(
                     Message::DiskFsync {
                         file_id: self.file_id,
@@ -139,20 +147,22 @@ impl StateMachine for WalWriter {
             Message::DiskFsyncOk { file_id } if file_id == self.file_id => {
                 self.fsync_pending = false;
                 self.fsynced_lsn = self.next_lsn;
+                let requester = self.fsync_requester.take().unwrap_or(self.reply_to);
                 Some(vec![(
                     Message::WalFsyncOk,
                     Destination {
-                        actor: self.reply_to,
+                        actor: requester,
                         delay: 0,
                     },
                 )])
             }
             Message::DiskFsyncErr { file_id, reason } if file_id == self.file_id => {
                 self.fsync_pending = false;
+                let requester = self.fsync_requester.take().unwrap_or(self.reply_to);
                 Some(vec![(
                     Message::WalFsyncErr { reason },
                     Destination {
-                        actor: self.reply_to,
+                        actor: requester,
                         delay: 0,
                     },
                 )])

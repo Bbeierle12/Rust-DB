@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::config;
+use crate::config::DatabaseConfig;
 use crate::storage::page::BTreeNode;
 use crate::storage::page_alloc::PageAllocator;
 use crate::storage::types::PageId;
@@ -45,6 +45,7 @@ impl BTreeEngine {
         id: ActorId,
         buf_pool_actor: ActorId,
         wal_actor: ActorId,
+        cfg: &DatabaseConfig,
     ) -> Self {
         Self {
             id,
@@ -53,24 +54,9 @@ impl BTreeEngine {
             nodes: BTreeMap::new(),
             root: None,
             allocator: PageAllocator::new(),
-            max_leaf: config::BTREE_MAX_LEAF_ENTRIES,
-            max_internal: config::BTREE_MAX_INTERNAL_KEYS,
+            max_leaf: cfg.btree_max_leaf_entries,
+            max_internal: cfg.btree_max_internal_keys,
             initialized: false,
-        }
-    }
-
-    /// Create with custom limits (useful for testing splits with small values).
-    pub fn with_limits(
-        id: ActorId,
-        buf_pool_actor: ActorId,
-        wal_actor: ActorId,
-        max_leaf: usize,
-        max_internal: usize,
-    ) -> Self {
-        Self {
-            max_leaf,
-            max_internal,
-            ..Self::new(id, buf_pool_actor, wal_actor)
         }
     }
 
