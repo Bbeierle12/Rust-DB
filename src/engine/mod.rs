@@ -525,12 +525,28 @@ impl Database {
                     _ => return Err(DbError::Sql("expected VALUES clause".into())),
                 };
 
+                // Parse RETURNING clause
+                let has_returning = insert.returning.as_ref().map_or(false, |r| !r.is_empty());
+                let returning_cols = if has_returning {
+                    parse_returning_cols(insert.returning.as_ref().unwrap(), &schema)?
+                } else {
+                    vec![]
+                };
+                let mut returned_rows: Vec<Row> = Vec::new();
+
+                // Parse ON CONFLICT clause
+                let on_conflict = &insert.on;
+
                 let txn_id = self.begin()?;
                 let mut count = 0u64;
                 for value_row in value_rows {
                     if value_row.len() != target_cols.len() {
                         self.abort(txn_id)?;
-                        return Err(DbError::Sql(format!("expected {} values, got {}", target_cols.len(), value_row.len())));
+                        return Err(DbError::Sql(format!(
+                            "expected {} values, got {}",
+                            target_cols.len(),
+                            value_row.len()
+                        )));
                     }
                     let mut row = Row::new();
                     for (col_name, expr) in target_cols.iter().zip(value_row.iter()) {
@@ -542,19 +558,104 @@ impl Database {
                             let val = row.get(&col.name).unwrap_or(&Value::Null);
                             if val.is_null() {
                                 self.abort(txn_id)?;
-                                return Err(DbError::Constraint(format!("column '{}' cannot be null", col.name)));
+                                return Err(DbError::Constraint(format!(
+                                    "column '{}' cannot be null",
+                                    col.name
+                                )));
                             }
                         }
                     }
-                    let pk_val = row.get(&schema.columns[0].name).cloned().unwrap_or(Value::Null);
+                    let pk_val =
+                        row.get(&schema.columns[0].name).cloned().unwrap_or(Value::Null);
                     let key = schema.make_key(&pk_val);
+
+                    // Check for existing row (for ON CONFLICT handling)
+                    let existing = self.get(txn_id, &key)?;
+                    match (existing, on_conflict) {
+                        (
+                            Some(existing_data),
+                            Some(sqlparser::ast::OnInsert::OnConflict(oc)),
+                        ) => {
+                            match &oc.action {
+                                sqlparser::ast::OnConflictAction::DoNothing => {
+                                    continue;
+                                }
+                                sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
+                                    let mut merged = schema
+                                        .decode_row(&existing_data)
+                                        .ok_or_else(|| {
+                                            DbError::Sql("corrupt row data".into())
+                                        })?;
+                                    for assignment in &do_update.assignments {
+                                        let col_name = match &assignment.target {
+                                            sqlparser::ast::AssignmentTarget::ColumnName(
+                                                name,
+                                            ) => name.to_string(),
+                                            sqlparser::ast::AssignmentTarget::Tuple(names) => {
+                                                names
+                                                    .first()
+                                                    .map(|n| n.to_string())
+                                                    .unwrap_or_default()
+                                            }
+                                        };
+                                        let value = resolve_excluded_value(
+                                            &assignment.value,
+                                            &row,
+                                        )?;
+                                        merged.insert(col_name, value);
+                                    }
+                                    let encoded = schema.encode_row(&merged);
+                                    self.put(txn_id, key, encoded)?;
+                                    if let Some(old_row) =
+                                        schema.decode_row(&existing_data)
+                                    {
+                                        for index in &indexes {
+                                            self.maintain_index_delete(
+                                                txn_id, &schema, index, &old_row,
+                                            )?;
+                                            self.maintain_index_insert(
+                                                txn_id, &schema, index, &merged,
+                                            )?;
+                                        }
+                                    }
+                                    if has_returning {
+                                        returned_rows.push(project_returning(
+                                            &merged,
+                                            &returning_cols,
+                                            &schema,
+                                        ));
+                                    }
+                                    count += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+
                     let value = schema.encode_row(&row);
                     self.put(txn_id, key, value)?;
-                    for index in &indexes { self.maintain_index_insert(txn_id, &schema, index, &row)?; }
+                    for index in &indexes {
+                        self.maintain_index_insert(txn_id, &schema, index, &row)?;
+                    }
+                    if has_returning {
+                        returned_rows.push(project_returning(
+                            &row,
+                            &returning_cols,
+                            &schema,
+                        ));
+                    }
                     count += 1;
                 }
                 self.commit(txn_id)?;
-                Ok(SqlResult::Execute(count))
+                if has_returning {
+                    Ok(SqlResult::Query {
+                        columns: returning_cols,
+                        rows: returned_rows,
+                    })
+                } else {
+                    Ok(SqlResult::Execute(count))
+                }
             }
             _ => Err(DbError::Sql("expected INSERT".into())),
         }
@@ -567,7 +668,7 @@ impl Database {
         let stmts = Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| DbError::Sql(format!("parse error: {}", e)))?;
         if stmts.len() != 1 { return Err(DbError::Sql("expected one statement".into())); }
         match &stmts[0] {
-            Statement::Update { table, assignments, selection, .. } => {
+            Statement::Update { table, assignments, selection, returning, .. } => {
                 let table_name = table.relation.to_string();
                 let inner = self.lock_inner()?;
                 let snapshot_ts = inner.next_ts.saturating_sub(1);
@@ -575,6 +676,15 @@ impl Database {
                     .ok_or_else(|| DbError::NoSuchTable(table_name.clone()))?;
                 let indexes = Catalog::list_indexes_for_table(&inner.store, &table_name, snapshot_ts);
                 drop(inner);
+
+                // Parse RETURNING clause
+                let has_returning = returning.as_ref().map_or(false, |r| !r.is_empty());
+                let returning_cols = if has_returning {
+                    parse_returning_cols(returning.as_ref().unwrap(), &schema)?
+                } else {
+                    vec![]
+                };
+                let mut returned_rows: Vec<Row> = Vec::new();
 
                 let rows = self.scan_table_rows(&schema)?;
                 let predicate = match selection {
@@ -605,10 +715,17 @@ impl Database {
                     let key = schema.make_key(&pk_val);
                     let value = schema.encode_row(&updated_row);
                     self.put(txn_id, key, value)?;
+                    if has_returning {
+                        returned_rows.push(project_returning(&updated_row, &returning_cols, &schema));
+                    }
                     count += 1;
                 }
                 self.commit(txn_id)?;
-                Ok(SqlResult::Execute(count))
+                if has_returning {
+                    Ok(SqlResult::Query { columns: returning_cols, rows: returned_rows })
+                } else {
+                    Ok(SqlResult::Execute(count))
+                }
             }
             _ => Err(DbError::Sql("expected UPDATE".into())),
         }
@@ -639,6 +756,15 @@ impl Database {
                 let indexes = Catalog::list_indexes_for_table(&inner.store, &table_name, snapshot_ts);
                 drop(inner);
 
+                // Parse RETURNING clause
+                let has_returning = delete.returning.as_ref().map_or(false, |r| !r.is_empty());
+                let returning_cols = if has_returning {
+                    parse_returning_cols(delete.returning.as_ref().unwrap(), &schema)?
+                } else {
+                    vec![]
+                };
+                let mut returned_rows: Vec<Row> = Vec::new();
+
                 let rows = self.scan_table_rows(&schema)?;
                 let predicate = match &delete.selection {
                     Some(expr) => Some(crate::query::sql::sql_to_plan(&format!("SELECT * FROM {} WHERE {}", table_name, expr), schema.clone())?),
@@ -651,6 +777,9 @@ impl Database {
                     if let Some(ref plan) = predicate {
                         if execute(plan, vec![row.clone()]).is_empty() { continue; }
                     }
+                    if has_returning {
+                        returned_rows.push(project_returning(row, &returning_cols, &schema));
+                    }
                     for index in &indexes { self.maintain_index_delete(txn_id, &schema, index, row)?; }
                     let pk_val = row.get(&schema.columns[0].name).cloned().unwrap_or(Value::Null);
                     let key = schema.make_key(&pk_val);
@@ -658,7 +787,11 @@ impl Database {
                     count += 1;
                 }
                 self.commit(txn_id)?;
-                Ok(SqlResult::Execute(count))
+                if has_returning {
+                    Ok(SqlResult::Query { columns: returning_cols, rows: returned_rows })
+                } else {
+                    Ok(SqlResult::Execute(count))
+                }
             }
             _ => Err(DbError::Sql("expected DELETE".into())),
         }
@@ -1041,6 +1174,104 @@ fn sql_expr_to_value(expr: &sqlparser::ast::Expr) -> DbResult<Value> {
                 _ => Ok(inner_val),
             }
         }
+        Expr::Function(func) => {
+            let name = func.name.to_string().to_uppercase();
+            use sqlparser::ast::FunctionArguments;
+            match name.as_str() {
+                "COALESCE" => {
+                    if let FunctionArguments::List(list) = &func.args {
+                        for arg in &list.args {
+                            if let sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(e)
+                            ) = arg {
+                                let val = sql_expr_to_value(e)?;
+                                if !val.is_null() {
+                                    return Ok(val);
+                                }
+                            }
+                        }
+                    }
+                    Ok(Value::Null)
+                }
+                "NOW" => {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let us = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as i64;
+                    Ok(Value::Timestamp(us))
+                }
+                _ => Err(DbError::Sql(format!("unsupported function: {}", name))),
+            }
+        }
         other => Err(DbError::Sql(format!("unsupported value expression: {:?}", other))),
+    }
+}
+
+/// Parse RETURNING clause items into column names.
+/// For RETURNING *, returns all schema column names.
+fn parse_returning_cols(
+    items: &[sqlparser::ast::SelectItem],
+    schema: &crate::query::expr::Schema,
+) -> DbResult<Vec<String>> {
+    let mut cols = Vec::new();
+    for item in items {
+        match item {
+            sqlparser::ast::SelectItem::Wildcard(_) => {
+                return Ok(schema.columns.iter().map(|c| c.name.clone()).collect());
+            }
+            sqlparser::ast::SelectItem::UnnamedExpr(expr) => match expr {
+                sqlparser::ast::Expr::Identifier(ident) => {
+                    cols.push(ident.value.clone());
+                }
+                _ => {
+                    return Err(DbError::Sql(
+                        "RETURNING only supports column names and *".into(),
+                    ));
+                }
+            },
+            sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => {
+                cols.push(alias.value.clone());
+            }
+            _ => {
+                return Err(DbError::Sql("unsupported RETURNING item".into()));
+            }
+        }
+    }
+    Ok(cols)
+}
+
+/// Project a row to only the RETURNING columns.
+fn project_returning(
+    row: &crate::query::expr::Row,
+    cols: &[String],
+    _schema: &crate::query::expr::Schema,
+) -> crate::query::expr::Row {
+    let mut result = BTreeMap::new();
+    for col in cols {
+        if let Some(val) = row.get(col) {
+            result.insert(col.clone(), val.clone());
+        } else {
+            result.insert(col.clone(), Value::Null);
+        }
+    }
+    result
+}
+
+/// Resolve a value expression, handling EXCLUDED.column references for ON CONFLICT DO UPDATE.
+fn resolve_excluded_value(
+    expr: &sqlparser::ast::Expr,
+    new_row: &crate::query::expr::Row,
+) -> DbResult<Value> {
+    match expr {
+        sqlparser::ast::Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let table = parts[0].value.to_uppercase();
+            let col = &parts[1].value;
+            if table == "EXCLUDED" {
+                return Ok(new_row.get(col).cloned().unwrap_or(Value::Null));
+            }
+            sql_expr_to_value(expr)
+        }
+        _ => sql_expr_to_value(expr),
     }
 }

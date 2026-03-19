@@ -1499,3 +1499,249 @@ fn engine_insert_select_decimal() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// SQL Function tests (COALESCE, NOW)
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn expr_coalesce_returns_first_non_null() {
+    let row = make_row(1, "Alice", 30, true);
+    let expr = Expr::function("COALESCE", vec![Expr::lit(Value::Null), Expr::lit(42i64)]);
+    assert_eq!(expr.eval(&row), Value::Int64(42));
+}
+
+#[test]
+fn expr_coalesce_all_null() {
+    let row = make_row(1, "Alice", 30, true);
+    let expr = Expr::function("COALESCE", vec![Expr::lit(Value::Null), Expr::lit(Value::Null)]);
+    assert_eq!(expr.eval(&row), Value::Null);
+}
+
+#[test]
+fn expr_coalesce_first_non_null() {
+    let row = make_row(1, "Alice", 30, true);
+    let expr = Expr::function("COALESCE", vec![Expr::lit("hello"), Expr::lit(42i64)]);
+    assert_eq!(expr.eval(&row), Value::Text("hello".into()));
+}
+
+#[test]
+fn expr_now_returns_timestamp() {
+    let row = make_row(1, "Alice", 30, true);
+    let expr = Expr::function("NOW", vec![]);
+    let result = expr.eval(&row);
+    match result {
+        Value::Timestamp(us) => assert!(us > 0),
+        other => panic!("expected Timestamp, got {:?}", other),
+    }
+}
+
+#[test]
+fn sql_coalesce_in_select() {
+    let schema = make_schema();
+    let plan = sql_to_plan("SELECT COALESCE(name, 'unknown') FROM users", schema).unwrap();
+    assert!(plan.table_name().is_some());
+}
+
+#[test]
+fn sql_now_in_select() {
+    let schema = make_schema();
+    let plan = sql_to_plan("SELECT NOW() FROM users", schema).unwrap();
+    assert!(plan.table_name().is_some());
+}
+
+#[test]
+fn engine_now_in_insert() {
+    let dir = std::env::temp_dir().join("rust_db_test_now_insert");
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = rust_dst_db::engine::Database::open(&dir).unwrap();
+    db.execute_sql("CREATE TABLE events (id INT NOT NULL, ts TIMESTAMP)").unwrap();
+    db.execute_sql("INSERT INTO events VALUES (1, NOW())").unwrap();
+    match db.execute_sql("SELECT * FROM events WHERE id = 1").unwrap() {
+        rust_dst_db::engine::SqlResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            match rows[0].get("ts") {
+                Some(Value::Timestamp(us)) => assert!(*us > 0),
+                other => panic!("expected Timestamp, got {:?}", other),
+            }
+        }
+        _ => panic!("expected query result"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn engine_coalesce_in_update() {
+    let dir = std::env::temp_dir().join("rust_db_test_coalesce_update");
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = rust_dst_db::engine::Database::open(&dir).unwrap();
+    db.execute_sql("CREATE TABLE items (id INT NOT NULL, name TEXT)").unwrap();
+    db.execute_sql("INSERT INTO items VALUES (1, 'original')").unwrap();
+    db.execute_sql("UPDATE items SET name = COALESCE(NULL, 'fallback') WHERE id = 1").unwrap();
+    match db.execute_sql("SELECT * FROM items WHERE id = 1").unwrap() {
+        rust_dst_db::engine::SqlResult::Query { rows, .. } => {
+            assert_eq!(rows[0].get("name"), Some(&Value::Text("fallback".into())));
+        }
+        _ => panic!("expected query result"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// RETURNING clause
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn engine_insert_returning_star() {
+    let dir = std::env::temp_dir().join("rust_db_test_insert_returning_star");
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = rust_dst_db::engine::Database::open(&dir).unwrap();
+    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)").unwrap();
+    let result = db.execute_sql("INSERT INTO users VALUES (1, 'Alice') RETURNING *").unwrap();
+    match result {
+        rust_dst_db::engine::SqlResult::Query { rows, columns } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get("id"), Some(&Value::Int64(1)));
+            assert_eq!(rows[0].get("name"), Some(&Value::Text("Alice".into())));
+            assert!(columns.contains(&"id".to_string()));
+            assert!(columns.contains(&"name".to_string()));
+        }
+        _ => panic!("expected query result"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn engine_insert_returning_columns() {
+    let dir = std::env::temp_dir().join("rust_db_test_insert_returning_cols");
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = rust_dst_db::engine::Database::open(&dir).unwrap();
+    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT, age INT)").unwrap();
+    let result = db.execute_sql("INSERT INTO users VALUES (1, 'Alice', 30) RETURNING id, name").unwrap();
+    match result {
+        rust_dst_db::engine::SqlResult::Query { rows, columns } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(columns, vec!["id", "name"]);
+            assert_eq!(rows[0].get("id"), Some(&Value::Int64(1)));
+            assert!(!rows[0].contains_key("age"));
+        }
+        _ => panic!("expected query result"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn engine_update_returning() {
+    let dir = std::env::temp_dir().join("rust_db_test_update_returning");
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = rust_dst_db::engine::Database::open(&dir).unwrap();
+    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)").unwrap();
+    db.execute_sql("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+    let result = db.execute_sql("UPDATE users SET name = 'Bob' WHERE id = 1 RETURNING *").unwrap();
+    match result {
+        rust_dst_db::engine::SqlResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get("name"), Some(&Value::Text("Bob".into())));
+        }
+        _ => panic!("expected query result"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn engine_delete_returning() {
+    let dir = std::env::temp_dir().join("rust_db_test_delete_returning");
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = rust_dst_db::engine::Database::open(&dir).unwrap();
+    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)").unwrap();
+    db.execute_sql("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+    db.execute_sql("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+    let result = db.execute_sql("DELETE FROM users WHERE id = 1 RETURNING *").unwrap();
+    match result {
+        rust_dst_db::engine::SqlResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get("name"), Some(&Value::Text("Alice".into())));
+        }
+        _ => panic!("expected query result"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ON CONFLICT
+// ═══════════════════════════════════════════════════════════════════════
+
+#[test]
+fn engine_on_conflict_do_nothing() {
+    let dir = std::env::temp_dir().join("rust_db_test_on_conflict_nothing");
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = rust_dst_db::engine::Database::open(&dir).unwrap();
+    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)").unwrap();
+    db.execute_sql("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+    // Insert with same PK, should be ignored
+    db.execute_sql("INSERT INTO users VALUES (1, 'Bob') ON CONFLICT DO NOTHING").unwrap();
+    match db.execute_sql("SELECT * FROM users WHERE id = 1").unwrap() {
+        rust_dst_db::engine::SqlResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get("name"), Some(&Value::Text("Alice".into())));
+        }
+        _ => panic!("expected query result"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn engine_on_conflict_do_update() {
+    let dir = std::env::temp_dir().join("rust_db_test_on_conflict_update");
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = rust_dst_db::engine::Database::open(&dir).unwrap();
+    db.execute_sql("CREATE TABLE counters (id INT NOT NULL, count INT)").unwrap();
+    db.execute_sql("INSERT INTO counters VALUES (1, 10)").unwrap();
+    db.execute_sql("INSERT INTO counters VALUES (1, 20) ON CONFLICT (id) DO UPDATE SET count = EXCLUDED.count").unwrap();
+    match db.execute_sql("SELECT * FROM counters WHERE id = 1").unwrap() {
+        rust_dst_db::engine::SqlResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get("count"), Some(&Value::Int64(20)));
+        }
+        _ => panic!("expected query result"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn engine_on_conflict_do_nothing_no_conflict() {
+    let dir = std::env::temp_dir().join("rust_db_test_on_conflict_no_conflict");
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = rust_dst_db::engine::Database::open(&dir).unwrap();
+    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)").unwrap();
+    // No existing row, should insert normally
+    db.execute_sql("INSERT INTO users VALUES (1, 'Alice') ON CONFLICT DO NOTHING").unwrap();
+    match db.execute_sql("SELECT * FROM users").unwrap() {
+        rust_dst_db::engine::SqlResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get("name"), Some(&Value::Text("Alice".into())));
+        }
+        _ => panic!("expected query result"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn engine_insert_returning_with_on_conflict() {
+    let dir = std::env::temp_dir().join("rust_db_test_returning_on_conflict");
+    let _ = std::fs::remove_dir_all(&dir);
+    let db = rust_dst_db::engine::Database::open(&dir).unwrap();
+    db.execute_sql("CREATE TABLE items (id INT NOT NULL, name TEXT)").unwrap();
+    db.execute_sql("INSERT INTO items VALUES (1, 'old')").unwrap();
+    let result = db.execute_sql(
+        "INSERT INTO items VALUES (1, 'new') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name RETURNING *"
+    ).unwrap();
+    match result {
+        rust_dst_db::engine::SqlResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get("name"), Some(&Value::Text("new".into())));
+        }
+        _ => panic!("expected query result"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

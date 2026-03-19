@@ -28,8 +28,15 @@ use pgwire::api::auth::{
 };
 use pgwire::api::ClientInfo;
 use pgwire::api::copy::NoopCopyHandler;
-use pgwire::api::query::{PlaceholderExtendedQueryHandler, SimpleQueryHandler};
-use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
+use pgwire::api::portal::Portal;
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::results::{
+    DataRowEncoder, DescribePortalResponse, DescribeStatementResponse,
+    FieldFormat, FieldInfo, QueryResponse, Response, Tag,
+};
+use pgwire::api::stmt::{QueryParser, StoredStatement};
+use pgwire::api::store::PortalStore;
+use pgwire::api::ClientPortalStore;
 use pgwire::api::{PgWireConnectionState, PgWireHandlerFactory, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::response::ErrorResponse;
@@ -279,6 +286,196 @@ fn value_to_text(v: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Extended query protocol (parameterized queries)
+// ---------------------------------------------------------------------------
+
+/// Query parser that stores SQL as a plain string.
+struct DbQueryParser;
+
+#[async_trait]
+impl QueryParser for DbQueryParser {
+    type Statement = String;
+
+    async fn parse_sql(&self, sql: &str, _types: &[Type]) -> PgWireResult<String> {
+        Ok(sql.to_owned())
+    }
+}
+
+/// Extended query handler that substitutes $1, $2, ... parameters into SQL
+/// and delegates to the same engine execution path as simple queries.
+struct DbExtendedQueryHandler {
+    db: Database,
+    conn_id: u64,
+    state: Arc<Mutex<ConnState>>,
+    parser: Arc<DbQueryParser>,
+}
+
+impl DbExtendedQueryHandler {
+    fn new(db: Database, conn_id: u64, state: Arc<Mutex<ConnState>>) -> Self {
+        Self {
+            db,
+            conn_id,
+            state,
+            parser: Arc::new(DbQueryParser),
+        }
+    }
+
+    fn execute_one<'a>(&self, sql: &str) -> Result<Response<'a>, Box<dyn std::error::Error>> {
+        let result = self.db.execute_sql(sql)?;
+
+        match result {
+            SqlResult::Begin(txn_id) => {
+                let mut state = self.state.lock().unwrap();
+                state.active_txn = Some(txn_id);
+                Ok(Response::Execution(Tag::new("BEGIN")))
+            }
+            SqlResult::Commit => {
+                let mut state = self.state.lock().unwrap();
+                if let Some(txn_id) = state.active_txn.take() {
+                    self.db.commit(txn_id)?;
+                }
+                Ok(Response::Execution(Tag::new("COMMIT")))
+            }
+            SqlResult::Rollback => {
+                let mut state = self.state.lock().unwrap();
+                if let Some(txn_id) = state.active_txn.take() {
+                    self.db.abort(txn_id)?;
+                }
+                Ok(Response::Execution(Tag::new("ROLLBACK")))
+            }
+            SqlResult::Execute(count) => {
+                Ok(Response::Execution(Tag::new(&format!("OK {}", count))))
+            }
+            SqlResult::Query { columns, rows } => {
+                let fields: Vec<FieldInfo> = columns
+                    .iter()
+                    .map(|name| {
+                        FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text)
+                    })
+                    .collect();
+                let schema = Arc::new(fields);
+
+                let rows_data: Vec<_> = rows
+                    .iter()
+                    .map(|row| {
+                        let mut encoder = DataRowEncoder::new(schema.clone());
+                        for col in &columns {
+                            let text = value_to_text(row.get(col).unwrap_or(&Value::Null));
+                            encoder.encode_field(&text)?;
+                        }
+                        encoder.finish()
+                    })
+                    .collect();
+
+                Ok(Response::Query(QueryResponse::new(
+                    schema,
+                    stream::iter(rows_data),
+                )))
+            }
+        }
+    }
+}
+
+/// Substitute $1, $2, ... placeholders with parameter values.
+/// Parameters are text-format bytes from the pgwire Portal.
+fn substitute_params(sql: &str, params: &[Option<bytes::Bytes>]) -> String {
+    let mut result = sql.to_string();
+    // Replace from highest index to lowest to avoid offset issues.
+    for (i, param) in params.iter().enumerate().rev() {
+        let placeholder = format!("${}", i + 1);
+        let replacement = match param {
+            Some(bytes) => {
+                let text = String::from_utf8_lossy(bytes);
+                // Escape single quotes in the value and wrap in quotes.
+                // Check if the value looks numeric to avoid quoting numbers.
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    "''".to_string()
+                } else if trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("false") {
+                    trimmed.to_string()
+                } else if trimmed.parse::<i64>().is_ok() || trimmed.parse::<f64>().is_ok() {
+                    trimmed.to_string()
+                } else {
+                    format!("'{}'", trimmed.replace('\'', "''"))
+                }
+            }
+            None => "NULL".to_string(),
+        };
+        result = result.replace(&placeholder, &replacement);
+    }
+    result
+}
+
+#[async_trait]
+impl ExtendedQueryHandler for DbExtendedQueryHandler {
+    type Statement = String;
+    type QueryParser = DbQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        self.parser.clone()
+    }
+
+    async fn do_query<'a, 'b: 'a, C>(
+        &'b self,
+        _client: &mut C,
+        portal: &'a Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response<'a>>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let sql = &portal.statement.statement;
+        let resolved_sql = substitute_params(sql, &portal.parameters);
+
+        info!(conn_id = self.conn_id, sql = %resolved_sql, "extended query");
+
+        match self.execute_one(&resolved_sql) {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                error!(conn_id = self.conn_id, error = %e, "extended query error");
+                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42000".to_string(),
+                    e.to_string(),
+                ))))
+            }
+        }
+    }
+
+    async fn do_describe_statement<C>(
+        &self,
+        _client: &mut C,
+        _target: &StoredStatement<Self::Statement>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // Return empty description — we don't know column types until execution.
+        Ok(DescribeStatementResponse::new(vec![], vec![]))
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        _client: &mut C,
+        _target: &Portal<Self::Statement>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        Ok(DescribePortalResponse::new(vec![]))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Handler factory
 // ---------------------------------------------------------------------------
 
@@ -291,7 +488,7 @@ struct DbHandlerFactory {
 impl PgWireHandlerFactory for DbHandlerFactory {
     type StartupHandler = DbStartupHandler;
     type SimpleQueryHandler = DbQueryHandler;
-    type ExtendedQueryHandler = PlaceholderExtendedQueryHandler;
+    type ExtendedQueryHandler = DbExtendedQueryHandler;
     type CopyHandler = NoopCopyHandler;
 
     fn startup_handler(&self) -> Arc<Self::StartupHandler> {
@@ -307,7 +504,9 @@ impl PgWireHandlerFactory for DbHandlerFactory {
     }
 
     fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
-        Arc::new(PlaceholderExtendedQueryHandler)
+        let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
+        let state = Arc::new(Mutex::new(ConnState { active_txn: None }));
+        Arc::new(DbExtendedQueryHandler::new(self.db.clone(), conn_id, state))
     }
 
     fn copy_handler(&self) -> Arc<Self::CopyHandler> {

@@ -580,6 +580,8 @@ pub enum Expr {
         when_clauses: Vec<(Expr, Expr)>,
         else_result: Option<Box<Expr>>,
     },
+    /// SQL function call (name, arguments).
+    Function(String, Vec<Expr>),
 }
 
 impl Expr {
@@ -675,6 +677,30 @@ impl Expr {
                     None => Value::Null,
                 }
             }
+            Expr::Function(name, args) => {
+                let uname = name.to_uppercase();
+                match uname.as_str() {
+                    "COALESCE" => {
+                        for arg in args {
+                            let val = arg.eval(row);
+                            if !val.is_null() {
+                                return val;
+                            }
+                        }
+                        Value::Null
+                    }
+                    "NOW" => {
+                        // Return current timestamp in microseconds since Unix epoch.
+                        use std::time::{SystemTime, UNIX_EPOCH};
+                        let us = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_micros() as i64;
+                        Value::Timestamp(us)
+                    }
+                    _ => Value::Null,
+                }
+            }
         }
     }
 
@@ -760,6 +786,9 @@ impl Expr {
             when_clauses,
             else_result: else_result.map(Box::new),
         }
+    }
+    pub fn function(name: impl Into<String>, args: Vec<Expr>) -> Self {
+        Expr::Function(name.into(), args)
     }
 }
 

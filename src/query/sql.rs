@@ -274,6 +274,7 @@ fn expr_to_col_name_qualified(expr: &SqlExpr) -> Result<String, SqlError> {
         SqlExpr::CompoundIdentifier(parts) => {
             Ok(parts.iter().map(|p| p.value.clone()).collect::<Vec<_>>().join("."))
         }
+        SqlExpr::Function(func) => Ok(func.name.to_string().to_uppercase()),
         other => Err(err(format!("expected column name, got: {:?}", other))),
     }
 }
@@ -309,6 +310,37 @@ fn sql_expr_to_expr_qualified(expr: &SqlExpr) -> Result<Expr, SqlError> {
             }
         }
         SqlExpr::Nested(inner) => sql_expr_to_expr_qualified(inner),
+        SqlExpr::Function(func) => {
+            let name = func.name.to_string().to_uppercase();
+            match name.as_str() {
+                "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {
+                    Err(err(format!("aggregate function {} not allowed in this context", name)))
+                }
+                _ => {
+                    use sqlparser::ast::FunctionArguments;
+                    let args = match &func.args {
+                        FunctionArguments::None => vec![],
+                        FunctionArguments::Subquery(_) => {
+                            return Err(err("subquery function args not supported"));
+                        }
+                        FunctionArguments::List(list) => {
+                            list.args.iter().map(|arg| {
+                                match arg {
+                                    sqlparser::ast::FunctionArg::Unnamed(
+                                        sqlparser::ast::FunctionArgExpr::Expr(e)
+                                    ) => sql_expr_to_expr_qualified(e),
+                                    sqlparser::ast::FunctionArg::Unnamed(
+                                        sqlparser::ast::FunctionArgExpr::Wildcard
+                                    ) => Ok(Expr::lit(Value::Null)),
+                                    other => Err(err(format!("unsupported function arg: {:?}", other))),
+                                }
+                            }).collect::<Result<Vec<_>, _>>()?
+                        }
+                    };
+                    Ok(Expr::function(name, args))
+                }
+            }
+        }
         other => Err(err(format!("unsupported expression: {:?}", other))),
     }
 }
@@ -542,6 +574,7 @@ fn expr_to_col_name(expr: &SqlExpr) -> Result<String, SqlError> {
     match expr {
         SqlExpr::Identifier(ident) => Ok(ident.value.clone()),
         SqlExpr::CompoundIdentifier(parts) => Ok(parts.last().map(|p| p.value.clone()).unwrap_or_default()),
+        SqlExpr::Function(func) => Ok(func.name.to_string().to_uppercase()),
         other => Err(err(format!("expected column name, got: {:?}", other))),
     }
 }
@@ -636,6 +669,37 @@ fn sql_expr_to_expr(expr: &SqlExpr) -> Result<Expr, SqlError> {
                 None => None,
             };
             Ok(Expr::case(op, when_clauses, else_r))
+        }
+        SqlExpr::Function(func) => {
+            let name = func.name.to_string().to_uppercase();
+            match name.as_str() {
+                "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {
+                    Err(err(format!("aggregate function {} not allowed in this context", name)))
+                }
+                _ => {
+                    use sqlparser::ast::FunctionArguments;
+                    let args = match &func.args {
+                        FunctionArguments::None => vec![],
+                        FunctionArguments::Subquery(_) => {
+                            return Err(err("subquery function args not supported"));
+                        }
+                        FunctionArguments::List(list) => {
+                            list.args.iter().map(|arg| {
+                                match arg {
+                                    sqlparser::ast::FunctionArg::Unnamed(
+                                        sqlparser::ast::FunctionArgExpr::Expr(e)
+                                    ) => sql_expr_to_expr(e),
+                                    sqlparser::ast::FunctionArg::Unnamed(
+                                        sqlparser::ast::FunctionArgExpr::Wildcard
+                                    ) => Ok(Expr::lit(Value::Null)),
+                                    other => Err(err(format!("unsupported function arg: {:?}", other))),
+                                }
+                            }).collect::<Result<Vec<_>, _>>()?
+                        }
+                    };
+                    Ok(Expr::function(name, args))
+                }
+            }
         }
         SqlExpr::TypedString { data_type, value } => {
             use crate::query::expr::{parse_timestamp_str, parse_date_str, parse_uuid_str};
