@@ -200,6 +200,10 @@ fn value_to_text(v: &Value) -> String {
         Value::Float64(f) => f.to_string(),
         Value::Text(s) => s.clone(),
         Value::Bytes(b) => format!("{:?}", b),
+        Value::Timestamp(us) => crate::query::expr::format_timestamp(*us),
+        Value::Date(days) => crate::query::expr::format_date(*days),
+        Value::Uuid(bytes) => crate::query::expr::format_uuid(bytes),
+        Value::Decimal(val, scale) => crate::query::expr::format_decimal(*val, *scale),
     }
 }
 

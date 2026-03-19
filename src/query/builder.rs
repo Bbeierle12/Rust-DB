@@ -1,5 +1,5 @@
 use crate::query::expr::{Expr, Schema};
-use crate::query::plan::{AggFunc, LogicalPlan, SortOrder};
+use crate::query::plan::{AggFunc, JoinType, LogicalPlan, SortOrder};
 
 /// Composable query builder — the Rust-native API differentiator.
 ///
@@ -86,6 +86,54 @@ impl QueryBuilder {
                 input: Box::new(self.plan),
                 group_by: group_by.into_iter().map(|c| c.into()).collect(),
                 agg_funcs: agg_funcs.into_iter().map(|(n, f)| (n.into(), f)).collect(),
+            },
+        }
+    }
+
+    /// Inner join with another plan on the given condition.
+    pub fn join(self, right: LogicalPlan, on: Expr) -> Self {
+        Self {
+            plan: LogicalPlan::Join {
+                left: Box::new(self.plan),
+                right: Box::new(right),
+                join_type: JoinType::Inner,
+                on: Some(on),
+            },
+        }
+    }
+
+    /// Left outer join with another plan on the given condition.
+    pub fn left_join(self, right: LogicalPlan, on: Expr) -> Self {
+        Self {
+            plan: LogicalPlan::Join {
+                left: Box::new(self.plan),
+                right: Box::new(right),
+                join_type: JoinType::Left,
+                on: Some(on),
+            },
+        }
+    }
+
+    /// Right outer join with another plan on the given condition.
+    pub fn right_join(self, right: LogicalPlan, on: Expr) -> Self {
+        Self {
+            plan: LogicalPlan::Join {
+                left: Box::new(self.plan),
+                right: Box::new(right),
+                join_type: JoinType::Right,
+                on: Some(on),
+            },
+        }
+    }
+
+    /// Cross join with another plan (no ON condition).
+    pub fn cross_join(self, right: LogicalPlan) -> Self {
+        Self {
+            plan: LogicalPlan::Join {
+                left: Box::new(self.plan),
+                right: Box::new(right),
+                join_type: JoinType::Cross,
+                on: None,
             },
         }
     }

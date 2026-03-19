@@ -1,10 +1,19 @@
-use crate::query::expr::{Expr, Schema};
+use crate::query::expr::{Expr, Schema, Value};
 
 /// Sort direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOrder {
     Asc,
     Desc,
+}
+
+/// Join type for multi-table queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Cross,
 }
 
 /// Aggregate function.
@@ -53,6 +62,28 @@ pub enum LogicalPlan {
         group_by: Vec<String>,
         agg_funcs: Vec<(String, AggFunc)>, // (output_col_name, func)
     },
+    /// Remove duplicate rows.
+    Distinct {
+        input: Box<LogicalPlan>,
+    },
+    /// Skip the first n rows.
+    Offset {
+        input: Box<LogicalPlan>,
+        n: usize,
+    },
+    /// Join two plans together.
+    Join {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        join_type: JoinType,
+        on: Option<Expr>,
+    },
+    /// Index scan: look up rows via a secondary index.
+    IndexScan {
+        schema: Schema,
+        index_name: String,
+        lookup_values: Vec<Value>,
+    },
 }
 
 impl LogicalPlan {
@@ -60,11 +91,15 @@ impl LogicalPlan {
     pub fn table_name(&self) -> Option<&str> {
         match self {
             LogicalPlan::Scan { schema } => Some(&schema.table),
+            LogicalPlan::IndexScan { schema, .. } => Some(&schema.table),
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. }
-            | LogicalPlan::Aggregate { input, .. } => input.table_name(),
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Distinct { input, .. }
+            | LogicalPlan::Offset { input, .. } => input.table_name(),
+            LogicalPlan::Join { left, .. } => left.table_name(),
         }
     }
 
@@ -72,11 +107,48 @@ impl LogicalPlan {
     pub fn root_schema(&self) -> Option<&Schema> {
         match self {
             LogicalPlan::Scan { schema } => Some(schema),
+            LogicalPlan::IndexScan { schema, .. } => Some(schema),
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. }
-            | LogicalPlan::Aggregate { input, .. } => input.root_schema(),
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Distinct { input, .. }
+            | LogicalPlan::Offset { input, .. } => input.root_schema(),
+            LogicalPlan::Join { left, .. } => left.root_schema(),
+        }
+    }
+
+    /// Collect all table names referenced in this plan.
+    pub fn collect_table_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        self.collect_table_names_inner(&mut names);
+        names
+    }
+
+    fn collect_table_names_inner(&self, names: &mut Vec<String>) {
+        match self {
+            LogicalPlan::Scan { schema } => {
+                if !names.contains(&schema.table) {
+                    names.push(schema.table.clone());
+                }
+            }
+            LogicalPlan::IndexScan { schema, .. } => {
+                if !names.contains(&schema.table) {
+                    names.push(schema.table.clone());
+                }
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Distinct { input, .. }
+            | LogicalPlan::Offset { input, .. } => input.collect_table_names_inner(names),
+            LogicalPlan::Join { left, right, .. } => {
+                left.collect_table_names_inner(names);
+                right.collect_table_names_inner(names);
+            }
         }
     }
 }

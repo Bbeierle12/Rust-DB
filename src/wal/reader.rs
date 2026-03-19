@@ -45,11 +45,17 @@ impl WalReader {
 
         while pos + header_size <= data.len() {
             // Read length.
-            let len_bytes: [u8; 4] = data[pos..pos + 4].try_into().unwrap();
+            let len_bytes: [u8; 4] = match data.get(pos..pos + 4).and_then(|s| s.try_into().ok()) {
+                Some(b) => b,
+                None => break, // Truncated header — stop.
+            };
             let payload_len = u32::from_le_bytes(len_bytes) as usize;
 
             // Read CRC32.
-            let crc_bytes: [u8; 4] = data[pos + 4..pos + 8].try_into().unwrap();
+            let crc_bytes: [u8; 4] = match data.get(pos + 4..pos + 8).and_then(|s| s.try_into().ok()) {
+                Some(b) => b,
+                None => break, // Truncated header — stop.
+            };
             let stored_crc = u32::from_le_bytes(crc_bytes);
 
             // Bounds check.

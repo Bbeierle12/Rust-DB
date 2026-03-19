@@ -99,6 +99,9 @@ pub struct DatabaseConfig {
     pub raft_election_timeout_max: u64,
     pub raft_heartbeat_interval: u64,
     pub raft_max_entries_per_append: usize,
+
+    // Authentication
+    pub auth: crate::auth::AuthConfig,
 }
 
 impl Default for DatabaseConfig {
@@ -124,6 +127,7 @@ impl Default for DatabaseConfig {
             raft_election_timeout_max: RAFT_ELECTION_TIMEOUT_MAX_TICKS,
             raft_heartbeat_interval: RAFT_HEARTBEAT_INTERVAL_TICKS,
             raft_max_entries_per_append: RAFT_MAX_ENTRIES_PER_APPEND,
+            auth: crate::auth::AuthConfig::default(),
         }
     }
 }

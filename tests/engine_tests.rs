@@ -25,7 +25,7 @@ fn create_table_and_list() {
         _ => panic!("expected Execute result"),
     }
 
-    assert_eq!(db.table_count(), 1);
+    assert_eq!(db.table_count().unwrap(), 1);
 }
 
 #[test]
@@ -45,10 +45,10 @@ fn drop_table() {
     let db = Database::open(&dir).unwrap();
 
     db.execute_sql("CREATE TABLE temp (id BIGINT)").unwrap();
-    assert_eq!(db.table_count(), 1);
+    assert_eq!(db.table_count().unwrap(), 1);
 
     db.execute_sql("DROP TABLE temp").unwrap();
-    assert_eq!(db.table_count(), 0);
+    assert_eq!(db.table_count().unwrap(), 0);
 }
 
 // ─── INSERT Tests ────────────────────────────────────────────────────────────
@@ -227,7 +227,7 @@ fn wal_recovery_persists_data() {
     // Phase 2: reopen and verify data survived.
     {
         let db = Database::open(&dir).unwrap();
-        assert_eq!(db.table_count(), 1);
+        assert_eq!(db.table_count().unwrap(), 1);
 
         match db.execute_sql("SELECT * FROM users").unwrap() {
             SqlResult::Query { rows, .. } => {
@@ -274,7 +274,7 @@ fn explicit_transaction_api() {
 
     db.execute_sql("CREATE TABLE kv (id BIGINT, val TEXT)").unwrap();
 
-    let schema = db.get_schema("kv").unwrap();
+    let schema = db.get_schema("kv").unwrap().unwrap();
 
     let txn_id = db.begin().unwrap();
 
@@ -312,7 +312,7 @@ fn concurrent_transactions_conflict() {
     let txn2 = db.begin().unwrap();
 
     // Both write to the same key.
-    let schema = db.get_schema("counter").unwrap();
+    let schema = db.get_schema("counter").unwrap().unwrap();
 
     let key = schema.make_key(&Value::Int64(1));
     let mut row = BTreeMap::new();

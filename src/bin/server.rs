@@ -7,8 +7,12 @@
 //! Usage:
 //!   cargo run --features server --bin rust-db-server -- --data-dir ./mydb --port 5433
 //!
+//! With authentication:
+//!   cargo run --features server --bin rust-db-server -- --port 5433 --user admin --password secret
+//!
 //! Connect with:
 //!   psql -h 127.0.0.1 -p 5433
+//!   psql -h 127.0.0.1 -p 5433 -U admin   (when auth enabled)
 
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,22 +20,28 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use clap::Parser;
-use futures::{stream, Sink};
+use futures::{stream, Sink, SinkExt};
 use tokio::net::TcpListener;
 
-use pgwire::api::auth::noop::NoopStartupHandler;
+use pgwire::api::auth::{
+    DefaultServerParameterProvider, LoginInfo, StartupHandler,
+};
+use pgwire::api::ClientInfo;
 use pgwire::api::copy::NoopCopyHandler;
 use pgwire::api::query::{PlaceholderExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
-use pgwire::api::{ClientInfo, PgWireHandlerFactory, Type};
-use pgwire::error::{PgWireError, PgWireResult};
-use pgwire::messages::PgWireBackendMessage;
+use pgwire::api::{PgWireConnectionState, PgWireHandlerFactory, Type};
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::response::ErrorResponse;
+use pgwire::messages::startup::Authentication;
+use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
 
+use rust_dst_db::auth::AuthManager;
 use rust_dst_db::engine::{Database, SqlResult};
 use rust_dst_db::query::expr::Value;
 
-use tracing::{info, error, warn};
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "rust-db-server", about = "Rust-DB PostgreSQL-compatible server")]
@@ -47,7 +57,93 @@ struct Args {
     /// Bind address.
     #[arg(short, long, default_value = "0.0.0.0")]
     bind: String,
+
+    /// Username for authentication. If provided, authentication is enabled.
+    #[arg(short, long)]
+    user: Option<String>,
+
+    /// Password for the authenticated user.
+    #[arg(long)]
+    password: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+/// Startup handler that supports optional cleartext password authentication.
+///
+/// When `auth` is `Some`, the handler requests a cleartext password from the
+/// client and verifies it against the `AuthManager`. When `auth` is `None`,
+/// the handler behaves like the noop handler (no auth required).
+struct DbStartupHandler {
+    auth: Option<Arc<AuthManager>>,
+    params: Arc<DefaultServerParameterProvider>,
+}
+
+#[async_trait]
+impl StartupHandler for DbStartupHandler {
+    async fn on_startup<C>(
+        &self,
+        client: &mut C,
+        message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        match (&self.auth, message) {
+            // --- Auth disabled: noop startup ---
+            (None, PgWireFrontendMessage::Startup(ref startup)) => {
+                pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
+                pgwire::api::auth::finish_authentication(client, self.params.as_ref()).await?;
+            }
+
+            // --- Auth enabled: request password on Startup ---
+            (Some(_), PgWireFrontendMessage::Startup(ref startup)) => {
+                pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
+                client.set_state(PgWireConnectionState::AuthenticationInProgress);
+                client
+                    .send(PgWireBackendMessage::Authentication(
+                        Authentication::CleartextPassword,
+                    ))
+                    .await?;
+            }
+
+            // --- Auth enabled: verify password ---
+            (Some(auth), PgWireFrontendMessage::PasswordMessageFamily(pwd)) => {
+                let pwd = pwd.into_password()?;
+                let login_info = LoginInfo::from_client_info(client);
+                let username = login_info.user().unwrap_or("");
+
+                if auth.authenticate(username, &pwd.password) {
+                    info!(user = username, "authentication successful");
+                    pgwire::api::auth::finish_authentication(client, self.params.as_ref()).await?;
+                } else {
+                    warn!(user = username, "authentication failed");
+                    let error_info = ErrorInfo::new(
+                        "FATAL".to_string(),
+                        "28P01".to_string(),
+                        "password authentication failed".to_string(),
+                    );
+                    let error = ErrorResponse::from(error_info);
+                    client
+                        .feed(PgWireBackendMessage::ErrorResponse(error))
+                        .await?;
+                    client.close().await?;
+                }
+            }
+
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Query handling (unchanged logic, separated from startup handler)
+// ---------------------------------------------------------------------------
 
 /// Per-connection state tracking active transactions.
 struct ConnState {
@@ -57,7 +153,6 @@ struct ConnState {
 struct DbQueryHandler {
     db: Database,
     conn_id: u64,
-    /// Per-connection state (tracks active transaction).
     state: Arc<Mutex<ConnState>>,
 }
 
@@ -70,8 +165,6 @@ impl DbQueryHandler {
         }
     }
 }
-
-impl NoopStartupHandler for DbQueryHandler {}
 
 #[async_trait]
 impl SimpleQueryHandler for DbQueryHandler {
@@ -87,8 +180,8 @@ impl SimpleQueryHandler for DbQueryHandler {
     {
         info!(conn_id = self.conn_id, sql = query, "query");
 
-        // Split on semicolons to handle multi-statement queries.
-        let statements: Vec<&str> = query.split(';')
+        let statements: Vec<&str> = query
+            .split(';')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect();
@@ -100,13 +193,11 @@ impl SimpleQueryHandler for DbQueryHandler {
                 Ok(resp) => responses.push(resp),
                 Err(e) => {
                     error!(conn_id = self.conn_id, error = %e, "query error");
-                    return Err(PgWireError::UserError(Box::new(
-                        pgwire::error::ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "42000".to_string(),
-                            e.to_string(),
-                        ),
-                    )));
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "42000".to_string(),
+                        e.to_string(),
+                    ))));
                 }
             }
         }
@@ -180,23 +271,34 @@ fn value_to_text(v: &Value) -> String {
         Value::Float64(f) => f.to_string(),
         Value::Text(s) => s.clone(),
         Value::Bytes(b) => format!("{:?}", b),
+        Value::Timestamp(us) => rust_dst_db::query::expr::format_timestamp(*us),
+        Value::Date(days) => rust_dst_db::query::expr::format_date(*days),
+        Value::Uuid(bytes) => rust_dst_db::query::expr::format_uuid(bytes),
+        Value::Decimal(val, scale) => rust_dst_db::query::expr::format_decimal(*val, *scale),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Handler factory
+// ---------------------------------------------------------------------------
 
 struct DbHandlerFactory {
     db: Database,
     next_conn_id: Arc<AtomicU64>,
+    auth: Option<Arc<AuthManager>>,
 }
 
 impl PgWireHandlerFactory for DbHandlerFactory {
-    type StartupHandler = DbQueryHandler;
+    type StartupHandler = DbStartupHandler;
     type SimpleQueryHandler = DbQueryHandler;
     type ExtendedQueryHandler = PlaceholderExtendedQueryHandler;
     type CopyHandler = NoopCopyHandler;
 
     fn startup_handler(&self) -> Arc<Self::StartupHandler> {
-        let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
-        Arc::new(DbQueryHandler::new(self.db.clone(), conn_id))
+        Arc::new(DbStartupHandler {
+            auth: self.auth.clone(),
+            params: Arc::new(DefaultServerParameterProvider::default()),
+        })
     }
 
     fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
@@ -213,19 +315,44 @@ impl PgWireHandlerFactory for DbHandlerFactory {
     }
 }
 
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() {
-    // Initialize tracing.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
 
     let args = Args::parse();
 
     info!(data_dir = %args.data_dir, port = args.port, "starting Rust-DB server");
+
+    // Build auth manager if credentials were provided.
+    let auth = match (&args.user, &args.password) {
+        (Some(user), Some(password)) => {
+            let mut mgr = AuthManager::new();
+            mgr.add_user(user, password);
+            info!(user = %user, "authentication enabled");
+            Some(Arc::new(mgr))
+        }
+        (Some(_), None) => {
+            error!("--user requires --password");
+            std::process::exit(1);
+        }
+        (None, Some(_)) => {
+            error!("--password requires --user");
+            std::process::exit(1);
+        }
+        (None, None) => {
+            warn!("authentication disabled — any client can connect");
+            None
+        }
+    };
 
     // Open database.
     let db = match Database::open(&args.data_dir) {
@@ -236,7 +363,7 @@ async fn main() {
         }
     };
 
-    info!(tables = db.table_count(), "database opened, WAL recovery complete");
+    info!(tables = db.table_count().unwrap_or(0), "database opened, WAL recovery complete");
 
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");
@@ -254,6 +381,7 @@ async fn main() {
                 let factory = Arc::new(DbHandlerFactory {
                     db: db.clone(),
                     next_conn_id: Arc::clone(&next_conn_id),
+                    auth: auth.clone(),
                 });
 
                 tokio::spawn(async move {

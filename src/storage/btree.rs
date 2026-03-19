@@ -109,7 +109,10 @@ impl BTreeEngine {
         self.ensure_root();
         let mut dirty = Vec::new();
 
-        let leaf_id = self.find_leaf(&key).unwrap();
+        let leaf_id = match self.find_leaf(&key) {
+            Some(id) => id,
+            None => return dirty, // Should not happen after ensure_root, but avoid panic.
+        };
 
         // Insert into the leaf.
         if let Some(BTreeNode::Leaf { entries, .. }) = self.nodes.get_mut(&leaf_id) {
@@ -218,7 +221,10 @@ impl BTreeEngine {
             return;
         }
 
-        let node = self.nodes.get(&page_id).unwrap().clone();
+        let node = match self.nodes.get(&page_id) {
+            Some(n) => n.clone(),
+            None => return, // Node disappeared; skip split.
+        };
 
         match node {
             BTreeNode::Leaf {
@@ -315,7 +321,10 @@ impl BTreeEngine {
                     self.nodes.get_mut(&parent_id)
                 {
                     // Find where left_id is in children.
-                    let pos = children.iter().position(|c| *c == left_id).unwrap();
+                    let pos = match children.iter().position(|c| *c == left_id) {
+                        Some(p) => p,
+                        None => return, // Child not found in parent; skip.
+                    };
                     keys.insert(pos, separator);
                     children.insert(pos + 1, right_id);
                     dirty.push(parent_id);
