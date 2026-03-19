@@ -649,8 +649,10 @@ impl Database {
                 }
                 self.commit(txn_id)?;
                 if has_returning {
+                    let column_types = column_types_from_schema(&returning_cols, &schema);
                     Ok(SqlResult::Query {
                         columns: returning_cols,
+                        column_types,
                         rows: returned_rows,
                     })
                 } else {
@@ -704,7 +706,7 @@ impl Database {
                             sqlparser::ast::AssignmentTarget::ColumnName(name) => name.to_string(),
                             sqlparser::ast::AssignmentTarget::Tuple(names) => names.first().map(|n| n.to_string()).unwrap_or_default(),
                         };
-                        let value = sql_expr_to_value(&assignment.value)?;
+                        let value = resolve_update_value(&assignment.value, &updated_row)?;
                         updated_row.insert(col_name, value);
                     }
                     for index in &indexes {
@@ -722,7 +724,8 @@ impl Database {
                 }
                 self.commit(txn_id)?;
                 if has_returning {
-                    Ok(SqlResult::Query { columns: returning_cols, rows: returned_rows })
+                    let column_types = column_types_from_schema(&returning_cols, &schema);
+                    Ok(SqlResult::Query { columns: returning_cols, column_types, rows: returned_rows })
                 } else {
                     Ok(SqlResult::Execute(count))
                 }
@@ -788,7 +791,8 @@ impl Database {
                 }
                 self.commit(txn_id)?;
                 if has_returning {
-                    Ok(SqlResult::Query { columns: returning_cols, rows: returned_rows })
+                    let column_types = column_types_from_schema(&returning_cols, &schema);
+                    Ok(SqlResult::Query { columns: returning_cols, column_types, rows: returned_rows })
                 } else {
                     Ok(SqlResult::Execute(count))
                 }
@@ -828,7 +832,9 @@ impl Database {
             drop(inner);
 
             let result_rows = execute_with_sources(&plan, &sources);
-            let columns: Vec<String> = if result_rows.is_empty() {
+            let columns: Vec<String> = if let Some(proj_cols) = plan.project_columns() {
+                proj_cols
+            } else if result_rows.is_empty() {
                 // Collect from all schemas
                 table_names
                     .iter()
@@ -846,7 +852,8 @@ impl Database {
             } else {
                 result_rows[0].keys().cloned().collect()
             };
-            Ok(SqlResult::Query { columns, rows: result_rows })
+            let column_types = column_types_from_rows(&columns, &result_rows);
+            Ok(SqlResult::Query { columns, column_types, rows: result_rows })
         } else {
             // Single-table query: use original non-prefixed path.
             let table_name = table_names.into_iter().next()
@@ -857,12 +864,15 @@ impl Database {
             drop(inner);
 
             let result_rows = execute(&plan, rows);
-            let columns: Vec<String> = if result_rows.is_empty() {
+            let columns: Vec<String> = if let Some(proj_cols) = plan.project_columns() {
+                proj_cols
+            } else if result_rows.is_empty() {
                 schema.columns.iter().map(|c| c.name.clone()).collect()
             } else {
                 result_rows[0].keys().cloned().collect()
             };
-            Ok(SqlResult::Query { columns, rows: result_rows })
+            let column_types = column_types_from_schema(&columns, &schema);
+            Ok(SqlResult::Query { columns, column_types, rows: result_rows })
         }
     }
 
@@ -921,7 +931,11 @@ fn scan_table_rows_inner(store: &MvccStore, schema: &Schema, snapshot_ts: u64) -
 }
 
 pub enum SqlResult {
-    Query { columns: Vec<String>, rows: Vec<Row> },
+    Query {
+        columns: Vec<String>,
+        column_types: Vec<crate::query::expr::ValueType>,
+        rows: Vec<Row>,
+    },
     Execute(u64),
     Begin(u64),
     Commit,
@@ -1208,6 +1222,42 @@ fn sql_expr_to_value(expr: &sqlparser::ast::Expr) -> DbResult<Value> {
     }
 }
 
+/// Get column types for a list of column names from a schema.
+fn column_types_from_schema(
+    cols: &[String],
+    schema: &crate::query::expr::Schema,
+) -> Vec<crate::query::expr::ValueType> {
+    cols.iter()
+        .map(|name| {
+            schema
+                .columns
+                .iter()
+                .find(|c| c.name == *name)
+                .map(|c| c.col_type.clone())
+                .unwrap_or(crate::query::expr::ValueType::Text)
+        })
+        .collect()
+}
+
+/// Infer column types from the first result row (fallback when schema is unavailable).
+fn column_types_from_rows(
+    cols: &[String],
+    rows: &[Row],
+) -> Vec<crate::query::expr::ValueType> {
+    if let Some(first_row) = rows.first() {
+        cols.iter()
+            .map(|name| {
+                first_row
+                    .get(name)
+                    .map(|v| v.value_type())
+                    .unwrap_or(crate::query::expr::ValueType::Text)
+            })
+            .collect()
+    } else {
+        vec![crate::query::expr::ValueType::Text; cols.len()]
+    }
+}
+
 /// Parse RETURNING clause items into column names.
 /// For RETURNING *, returns all schema column names.
 fn parse_returning_cols(
@@ -1256,6 +1306,115 @@ fn project_returning(
         }
     }
     result
+}
+
+/// Resolve an expression in UPDATE SET context, supporting column references against the current row.
+fn resolve_update_value(
+    expr: &sqlparser::ast::Expr,
+    current_row: &crate::query::expr::Row,
+) -> DbResult<Value> {
+    use sqlparser::ast::{Expr, BinaryOperator, FunctionArguments, FunctionArg, FunctionArgExpr};
+    match expr {
+        // Column reference — look up in current row
+        Expr::Identifier(ident) => {
+            Ok(current_row.get(&ident.value).cloned().unwrap_or(Value::Null))
+        }
+        // Qualified column reference (table.column)
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let col = &parts[1].value;
+            Ok(current_row.get(col).cloned().unwrap_or(Value::Null))
+        }
+        // Binary operations (e.g., buy_count + 1)
+        Expr::BinaryOp { left, op, right } => {
+            let left_val = resolve_update_value(left, current_row)?;
+            let right_val = resolve_update_value(right, current_row)?;
+            use crate::query::expr::{Expr as QExpr};
+            type BinFn = fn(QExpr, QExpr) -> QExpr;
+            let arith_op: Option<BinFn> = match op {
+                BinaryOperator::Plus => Some(QExpr::add),
+                BinaryOperator::Minus => Some(QExpr::sub),
+                BinaryOperator::Multiply => Some(QExpr::mul),
+                BinaryOperator::Divide => Some(QExpr::div),
+                BinaryOperator::Modulo => Some(QExpr::modulo),
+                _ => None,
+            };
+            if let Some(make_expr) = arith_op {
+                let dummy_row: crate::query::expr::Row = BTreeMap::new();
+                let e = make_expr(
+                    QExpr::Lit(left_val),
+                    QExpr::Lit(right_val),
+                );
+                Ok(e.eval(&dummy_row))
+            } else {
+                Err(DbError::Sql(format!("unsupported binary op in UPDATE SET: {:?}", op)))
+            }
+        }
+        // IS NULL / IS NOT NULL
+        Expr::IsNull(inner) => {
+            let val = resolve_update_value(inner, current_row)?;
+            Ok(Value::Bool(val.is_null()))
+        }
+        Expr::IsNotNull(inner) => {
+            let val = resolve_update_value(inner, current_row)?;
+            Ok(Value::Bool(!val.is_null()))
+        }
+        // CASE WHEN ... THEN ... ELSE ... END
+        Expr::Case { operand, conditions, results, else_result } => {
+            if operand.is_some() {
+                return Err(DbError::Sql("CASE <operand> not supported in UPDATE SET".into()));
+            }
+            for (cond, result) in conditions.iter().zip(results.iter()) {
+                let cond_val = resolve_update_value(cond, current_row)?;
+                if cond_val == Value::Bool(true) {
+                    return resolve_update_value(result, current_row);
+                }
+            }
+            if let Some(else_expr) = else_result {
+                resolve_update_value(else_expr, current_row)
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        // Functions (COALESCE, NOW)
+        Expr::Function(func) => {
+            let name = func.name.to_string().to_uppercase();
+            match name.as_str() {
+                "COALESCE" => {
+                    if let FunctionArguments::List(list) = &func.args {
+                        for arg in &list.args {
+                            if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                                let val = resolve_update_value(e, current_row)?;
+                                if !val.is_null() {
+                                    return Ok(val);
+                                }
+                            }
+                        }
+                    }
+                    Ok(Value::Null)
+                }
+                "NOW" => {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    let us = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as i64;
+                    Ok(Value::Timestamp(us))
+                }
+                _ => Err(DbError::Sql(format!("unsupported function in UPDATE SET: {}", name))),
+            }
+        }
+        // Comparison operators for CASE WHEN conditions
+        Expr::IsFalse(inner) => {
+            let val = resolve_update_value(inner, current_row)?;
+            Ok(Value::Bool(val == Value::Bool(false)))
+        }
+        Expr::IsTrue(inner) => {
+            let val = resolve_update_value(inner, current_row)?;
+            Ok(Value::Bool(val == Value::Bool(true)))
+        }
+        // Fall through to literal/cast handling
+        _ => sql_expr_to_value(expr),
+    }
 }
 
 /// Resolve a value expression, handling EXCLUDED.column references for ON CONFLICT DO UPDATE.

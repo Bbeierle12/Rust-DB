@@ -119,6 +119,20 @@ impl LogicalPlan {
         }
     }
 
+    /// Extract the projected column names if the outermost node is a Project.
+    /// Returns `None` for SELECT * (no explicit projection) or non-project plans.
+    pub fn project_columns(&self) -> Option<Vec<String>> {
+        match self {
+            LogicalPlan::Project { columns, .. } => Some(columns.clone()),
+            // Sort/Limit/Offset/Distinct wrap a Project — look inside.
+            LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Offset { input, .. }
+            | LogicalPlan::Distinct { input, .. } => input.project_columns(),
+            _ => None,
+        }
+    }
+
     /// Collect all table names referenced in this plan.
     pub fn collect_table_names(&self) -> Vec<String> {
         let mut names = Vec::new();

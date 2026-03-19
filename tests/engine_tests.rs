@@ -63,7 +63,7 @@ fn insert_and_select() {
     db.execute_sql("INSERT INTO users (id, name) VALUES (2, 'Bob')").unwrap();
 
     match db.execute_sql("SELECT * FROM users").unwrap() {
-        SqlResult::Query { columns, rows } => {
+        SqlResult::Query { columns, rows, .. } => {
             assert_eq!(rows.len(), 2);
             assert!(columns.contains(&"id".to_string()));
             assert!(columns.contains(&"name".to_string()));

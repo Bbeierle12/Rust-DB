@@ -953,7 +953,7 @@ fn engine_join_integration() {
     ).unwrap();
 
     match result {
-        rust_dst_db::engine::SqlResult::Query { rows, columns } => {
+        rust_dst_db::engine::SqlResult::Query { rows, columns, .. } => {
             assert_eq!(rows.len(), 3);
             // Columns should be prefixed with table names.
             assert!(columns.iter().any(|c| c.starts_with("users.")));
@@ -1599,7 +1599,7 @@ fn engine_insert_returning_star() {
     db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)").unwrap();
     let result = db.execute_sql("INSERT INTO users VALUES (1, 'Alice') RETURNING *").unwrap();
     match result {
-        rust_dst_db::engine::SqlResult::Query { rows, columns } => {
+        rust_dst_db::engine::SqlResult::Query { rows, columns, .. } => {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get("id"), Some(&Value::Int64(1)));
             assert_eq!(rows[0].get("name"), Some(&Value::Text("Alice".into())));
@@ -1619,7 +1619,7 @@ fn engine_insert_returning_columns() {
     db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT, age INT)").unwrap();
     let result = db.execute_sql("INSERT INTO users VALUES (1, 'Alice', 30) RETURNING id, name").unwrap();
     match result {
-        rust_dst_db::engine::SqlResult::Query { rows, columns } => {
+        rust_dst_db::engine::SqlResult::Query { rows, columns, .. } => {
             assert_eq!(rows.len(), 1);
             assert_eq!(columns, vec!["id", "name"]);
             assert_eq!(rows[0].get("id"), Some(&Value::Int64(1)));
