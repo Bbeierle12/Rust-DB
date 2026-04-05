@@ -341,6 +341,16 @@ fn sql_expr_to_expr_qualified(expr: &SqlExpr) -> Result<Expr, SqlError> {
                 }
             }
         }
+        SqlExpr::Like { negated, expr, pattern, .. } => {
+            let val = sql_expr_to_expr_qualified(expr)?;
+            let pat = sql_expr_to_expr_qualified(pattern)?;
+            let like_expr = Expr::like(val, pat);
+            if *negated {
+                Ok(Expr::not(like_expr))
+            } else {
+                Ok(like_expr)
+            }
+        }
         other => Err(err(format!("unsupported expression: {:?}", other))),
     }
 }

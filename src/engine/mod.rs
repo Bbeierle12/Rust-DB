@@ -327,6 +327,9 @@ impl Database {
                     let snapshot_ts = inner.active.get(&txn_id).unwrap().start_ts;
                     if Catalog::get_table(&inner.store, &schema.table, snapshot_ts).is_some() {
                         inner.active.remove(&txn_id);
+                        if ct.if_not_exists {
+                            return Ok(SqlResult::Execute(0));
+                        }
                         return Err(DbError::TableExists(schema.table.clone()));
                     }
                     inner.active.get_mut(&txn_id).unwrap().ddl_ops.push(DdlOp::CreateTable(schema));
@@ -905,6 +908,12 @@ impl Database {
         let inner = self.lock_inner()?;
         let ts = inner.next_ts.saturating_sub(1);
         Ok(Catalog::get_index(&inner.store, index_name, ts))
+    }
+
+    pub fn list_tables(&self) -> DbResult<Vec<Schema>> {
+        let inner = self.lock_inner()?;
+        let ts = inner.next_ts.saturating_sub(1);
+        Ok(Catalog::list_tables(&inner.store, ts))
     }
 
     pub fn list_indexes(&self, table_name: &str) -> DbResult<Vec<IndexDef>> {

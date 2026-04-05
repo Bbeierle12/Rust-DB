@@ -257,7 +257,7 @@ pub fn start_server(port: Option<u16>) -> mpsc::SyncSender<ClientRequest> {
     std::thread::spawn(move || {
         let rt = Runtime::new().expect("tokio runtime");
         rt.block_on(async move {
-            let addr = format!("0.0.0.0:{}", port);
+            let addr = format!("127.0.0.1:{}", port);
             let listener = TcpListener::bind(&addr).await.expect("bind");
 
             // Each connection gets its own handler sharing the same channel.

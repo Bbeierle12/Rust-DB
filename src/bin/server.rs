@@ -47,6 +47,7 @@ use pgwire::tokio::process_socket;
 use rust_dst_db::auth::AuthManager;
 use rust_dst_db::engine::{Database, SqlResult};
 use rust_dst_db::query::expr::Value;
+use rust_dst_db::web;
 
 use tracing::{error, info, warn};
 
@@ -62,8 +63,12 @@ struct Args {
     port: u16,
 
     /// Bind address.
-    #[arg(short, long, default_value = "0.0.0.0")]
+    #[arg(short, long, default_value = "127.0.0.1")]
     bind: String,
+
+    /// Port for the web UI.
+    #[arg(short, long, default_value_t = 8080)]
+    web_port: u16,
 
     /// Username for authentication. If provided, authentication is enabled.
     #[arg(short, long)]
@@ -84,7 +89,7 @@ struct Args {
 /// client and verifies it against the `AuthManager`. When `auth` is `None`,
 /// the handler behaves like the noop handler (no auth required).
 struct DbStartupHandler {
-    auth: Option<Arc<AuthManager>>,
+    auth: Option<Arc<Mutex<AuthManager>>>,
     params: Arc<DefaultServerParameterProvider>,
 }
 
@@ -124,7 +129,7 @@ impl StartupHandler for DbStartupHandler {
                 let login_info = LoginInfo::from_client_info(client);
                 let username = login_info.user().unwrap_or("");
 
-                if auth.authenticate(username, &pwd.password) {
+                if auth.lock().unwrap().authenticate(username, &pwd.password) {
                     info!(user = username, "authentication successful");
                     pgwire::api::auth::finish_authentication(client, self.params.as_ref()).await?;
                 } else {
@@ -215,7 +220,11 @@ impl SimpleQueryHandler for DbQueryHandler {
 
 impl DbQueryHandler {
     fn execute_one<'a>(&self, sql: &str) -> Result<Response<'a>, Box<dyn std::error::Error>> {
-        let result = self.db.execute_sql(sql)?;
+        let preprocessed = preprocess_sql(sql);
+        if let Some(intercepted) = intercept_system_query(&preprocessed, &self.db) {
+            return Ok(intercepted);
+        }
+        let result = self.db.execute_sql(&preprocessed)?;
         execute_sql_result(result, &self.state, &self.db)
     }
 }
@@ -265,7 +274,13 @@ fn execute_sql_result<'a>(
             Ok(Response::Execution(Tag::new(&format!("OK {}", count))))
         }
         SqlResult::Query { columns, column_types, rows } => {
-            let fields: Vec<FieldInfo> = columns
+            // Strip table prefix (e.g. "devices.id" → "id") to match PostgreSQL convention.
+            // The engine keeps qualified names internally; clients expect unqualified names.
+            let display_names: Vec<String> = columns.iter().map(|name| {
+                if let Some(pos) = name.rfind('.') { name[pos+1..].to_string() } else { name.clone() }
+            }).collect();
+
+            let fields: Vec<FieldInfo> = display_names
                 .iter()
                 .enumerate()
                 .map(|(i, name)| {
@@ -279,8 +294,11 @@ fn execute_sql_result<'a>(
                 .iter()
                 .map(|row| {
                     let mut encoder = DataRowEncoder::new(schema.clone());
-                    for col in &columns {
-                        let val = row.get(col).unwrap_or(&Value::Null);
+                    for (i, col) in columns.iter().enumerate() {
+                        // Try qualified name first, then unqualified fallback.
+                        let val = row.get(col)
+                            .or_else(|| row.get(display_names[i].as_str()))
+                            .unwrap_or(&Value::Null);
                         if val.is_null() {
                             encoder.encode_field(&None::<&str>)?;
                         } else {
@@ -315,6 +333,489 @@ fn value_to_text(v: &Value) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SQL preprocessing — strip PostgreSQL ::type casts before execution
+// ---------------------------------------------------------------------------
+
+/// Strip `::typename` casts so Rust-DB's engine can parse SQLAlchemy/asyncpg SQL.
+/// Handles `$1::jsonb`, `'foo'::text`, `NULL::integer`, and compound types like
+/// `::double precision` and `::character varying`.
+/// Ignores `::` that appear inside single-quoted string literals.
+fn preprocess_sql(sql: &str) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let n = chars.len();
+    let mut result = String::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        // Consume a single-quoted string literal verbatim.
+        if chars[i] == '\'' {
+            result.push('\'');
+            i += 1;
+            while i < n {
+                if chars[i] == '\'' {
+                    result.push('\'');
+                    i += 1;
+                    if i < n && chars[i] == '\'' {
+                        result.push('\'');
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    result.push(chars[i]);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // Detect and strip :: cast operator.
+        if i + 1 < n && chars[i] == ':' && chars[i + 1] == ':' {
+            i += 2;
+            // Consume the first identifier word (e.g. "timestamp", "character", "double").
+            while i < n && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            // Skip [] for array types.
+            while i < n && (chars[i] == '[' || chars[i] == ']') {
+                i += 1;
+            }
+            // Consume multi-word compound type suffixes (case-insensitive).
+            // Build lowercase slice of remaining chars to match against known patterns.
+            let rest_lower: String = chars[i..].iter().collect::<String>().to_lowercase();
+            let suffixes = [
+                " without time zone",
+                " with time zone",
+                " time zone",
+                " precision",
+                " varying",
+                " zone",
+            ];
+            for suffix in suffixes {
+                if rest_lower.starts_with(suffix) {
+                    i += suffix.len();
+                    break;
+                }
+            }
+            // Skip [] after compound types too.
+            while i < n && (chars[i] == '[' || chars[i] == ']') {
+                i += 1;
+            }
+            continue;
+        }
+        result.push(chars[i]);
+        i += 1;
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
+// System / catalog query interception helpers
+// ---------------------------------------------------------------------------
+
+fn empty_query_response<'a>() -> Response<'a> {
+    Response::Query(QueryResponse::new(Arc::new(vec![]), stream::iter(vec![])))
+}
+
+fn single_text_row<'a>(col_name: &str, value: &str) -> Response<'a> {
+    let fields = vec![FieldInfo::new(col_name.to_string(), None, None, Type::TEXT, FieldFormat::Text)];
+    let schema = Arc::new(fields);
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    let s = value.to_string();
+    let _ = encoder.encode_field(&Some(s.as_str()));
+    let row = encoder.finish();
+    Response::Query(QueryResponse::new(schema, stream::iter(vec![row])))
+}
+
+fn single_bool_row<'a>(col_name: &str, value: bool) -> Response<'a> {
+    // Use TEXT type to avoid binary-format decoding issues with asyncpg.
+    let fields = vec![FieldInfo::new(col_name.to_string(), None, None, Type::TEXT, FieldFormat::Text)];
+    let schema = Arc::new(fields);
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    let _ = encoder.encode_field(&Some(if value { "t" } else { "f" }));
+    let row = encoder.finish();
+    Response::Query(QueryResponse::new(schema, stream::iter(vec![row])))
+}
+
+/// Extract the value from `col = 'value'` in a normalised (lowercase) SQL string.
+fn extract_eq_filter(norm: &str, col: &str) -> Option<String> {
+    // Search all occurrences of `col` until we find one followed by `= 'value'`
+    let mut search_from = 0;
+    while let Some(pos) = norm[search_from..].find(col) {
+        let abs_pos = search_from + pos;
+        let rest = norm[abs_pos + col.len()..].trim_start();
+        if let Some(rest) = rest.strip_prefix('=') {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('\'') {
+                if let Some(end) = rest.find('\'') {
+                    return Some(rest[..end].to_string());
+                }
+            }
+        }
+        search_from = abs_pos + col.len();
+    }
+    None
+}
+
+fn value_type_to_sql_type(vt: &rust_dst_db::query::expr::ValueType) -> &'static str {
+    use rust_dst_db::query::expr::ValueType;
+    match vt {
+        ValueType::Bool => "boolean",
+        ValueType::Int64 => "bigint",
+        ValueType::Float64 => "double precision",
+        ValueType::Text => "text",
+        ValueType::Bytes => "bytea",
+        ValueType::Timestamp => "timestamp without time zone",
+        ValueType::Date => "date",
+        ValueType::Uuid => "uuid",
+        ValueType::Decimal => "numeric",
+        ValueType::Null => "text",
+    }
+}
+
+fn information_schema_tables_response<'a>(norm: &str, db: &Database) -> Response<'a> {
+    let fields = vec![
+        FieldInfo::new("table_catalog".into(), None, None, Type::TEXT, FieldFormat::Text),
+        FieldInfo::new("table_schema".into(),  None, None, Type::TEXT, FieldFormat::Text),
+        FieldInfo::new("table_name".into(),    None, None, Type::TEXT, FieldFormat::Text),
+        FieldInfo::new("table_type".into(),    None, None, Type::TEXT, FieldFormat::Text),
+    ];
+    let schema = Arc::new(fields);
+
+    let tables = db.list_tables().unwrap_or_default();
+    let is_exists = norm.trim_start().starts_with("select exists");
+    let name_filter = extract_eq_filter(norm, "table_name");
+
+    let filtered: Vec<_> = tables.iter()
+        .filter(|t| name_filter.as_deref().map_or(true, |f| t.table == f))
+        .collect();
+
+    if is_exists {
+        return single_bool_row("exists", !filtered.is_empty());
+    }
+
+    let rows: Vec<_> = filtered.iter().map(|t| {
+        let mut encoder = DataRowEncoder::new(schema.clone());
+        let _ = encoder.encode_field(&Some("rustdb"));
+        let _ = encoder.encode_field(&Some("public"));
+        let _ = encoder.encode_field(&Some(t.table.as_str()));
+        let _ = encoder.encode_field(&Some("BASE TABLE"));
+        encoder.finish()
+    }).collect();
+
+    Response::Query(QueryResponse::new(schema, stream::iter(rows)))
+}
+
+fn information_schema_columns_response<'a>(norm: &str, db: &Database) -> Response<'a> {
+    // All TEXT to avoid binary-format decoding issues with asyncpg.
+    let fields = vec![
+        FieldInfo::new("table_name".into(),               None, None, Type::TEXT, FieldFormat::Text),
+        FieldInfo::new("column_name".into(),              None, None, Type::TEXT, FieldFormat::Text),
+        FieldInfo::new("ordinal_position".into(),         None, None, Type::TEXT, FieldFormat::Text),
+        FieldInfo::new("column_default".into(),           None, None, Type::TEXT, FieldFormat::Text),
+        FieldInfo::new("is_nullable".into(),              None, None, Type::TEXT, FieldFormat::Text),
+        FieldInfo::new("data_type".into(),                None, None, Type::TEXT, FieldFormat::Text),
+        FieldInfo::new("character_maximum_length".into(), None, None, Type::TEXT, FieldFormat::Text),
+        FieldInfo::new("numeric_precision".into(),        None, None, Type::TEXT, FieldFormat::Text),
+        FieldInfo::new("numeric_scale".into(),            None, None, Type::TEXT, FieldFormat::Text),
+    ];
+    let schema = Arc::new(fields);
+
+    let tables = db.list_tables().unwrap_or_default();
+    let table_filter = extract_eq_filter(norm, "table_name");
+
+    let mut rows = Vec::new();
+    for tbl in &tables {
+        if table_filter.as_deref().map_or(false, |f| tbl.table != f) {
+            continue;
+        }
+        for (i, col) in tbl.columns.iter().enumerate() {
+            let mut encoder = DataRowEncoder::new(schema.clone());
+            let pos = (i as i64 + 1).to_string();
+            let _ = encoder.encode_field(&Some(tbl.table.as_str()));
+            let _ = encoder.encode_field(&Some(col.name.as_str()));
+            let _ = encoder.encode_field(&Some(pos.as_str()));
+            let _ = encoder.encode_field(&None::<&str>);
+            let _ = encoder.encode_field(&Some(if col.nullable { "YES" } else { "NO" }));
+            let _ = encoder.encode_field(&Some(value_type_to_sql_type(&col.col_type)));
+            let _ = encoder.encode_field(&None::<&str>);
+            let _ = encoder.encode_field(&None::<&str>);
+            let _ = encoder.encode_field(&None::<&str>);
+            rows.push(encoder.finish());
+        }
+    }
+
+    Response::Query(QueryResponse::new(schema, stream::iter(rows)))
+}
+
+/// Intercept PostgreSQL system/catalog queries that Rust-DB cannot execute natively.
+/// Returns `Some(Response)` if intercepted; `None` to let the engine handle it.
+fn intercept_system_query<'a>(sql: &str, db: &Database) -> Option<Response<'a>> {
+    let norm = sql.trim().to_lowercase();
+
+    // ── DDL / connection-control commands ─────────────────────────────────
+    if norm.starts_with("set ") || norm == "set"
+        || norm.starts_with("reset ") || norm == "reset"
+        || norm.starts_with("discard ") || norm == "discard"
+        || norm.starts_with("deallocate ") || norm == "deallocate"
+    {
+        return Some(Response::Execution(Tag::new("SET")));
+    }
+
+    if norm.starts_with("show ") {
+        let param = norm["show ".len()..].trim();
+        let value = match param {
+            "transaction_isolation" => "read committed",
+            "timezone" | "time zone" => "UTC",
+            "server_encoding" | "client_encoding" => "UTF8",
+            "server_version" => "14.0",
+            "search_path" => "public",
+            "max_connections" => "100",
+            _ => "",
+        };
+        return Some(single_text_row(param, value));
+    }
+
+    // ── version() — intercept before the broad pg_catalog catch-all ───────
+    if norm.contains("version()") {
+        return Some(single_text_row("version", "PostgreSQL 14.0 on Rust-DB (custom engine)"));
+    }
+
+    // ── pg_catalog.pg_class — SQLAlchemy table-existence check ───────────
+    // Intercept: SELECT pg_catalog.pg_class.relname FROM pg_catalog.pg_class ...
+    // WHERE pg_catalog.pg_class.relname = 'tablename' ...
+    if (norm.contains("pg_class") || norm.contains("pg_catalog."))
+        && norm.contains("relname")
+        && norm.starts_with("select")
+    {
+        // Extract the relname filter value ('devices', 'ports', etc.)
+        if let Some(table_name) = extract_eq_filter(&norm, "relname") {
+            let exists = db.get_schema(&table_name).ok().flatten().is_some();
+            if exists {
+                let schema = Arc::new(vec![
+                    FieldInfo::new("relname".into(), None, None, Type::TEXT, FieldFormat::Text),
+                ]);
+                let mut encoder = DataRowEncoder::new(schema.clone());
+                encoder.encode_field_with_type_and_format(&table_name, &Type::TEXT, FieldFormat::Text).ok();
+                return Some(Response::Query(QueryResponse::new(schema, stream::iter(vec![encoder.finish()]))));
+            } else {
+                return Some(empty_query_response());
+            }
+        }
+        return Some(empty_query_response());
+    }
+
+    // ── pg_catalog / system catalog (everything else) ─────────────────────
+    if norm.contains("pg_catalog.")
+        || norm.contains("pg_type")
+        || norm.contains("pg_namespace")
+        || norm.contains("pg_class")
+        || norm.contains("pg_attribute")
+        || norm.contains("pg_index")
+        || norm.contains("pg_constraint")
+        || norm.contains("pg_description")
+        || norm.contains("pg_statistic")
+        || norm.contains("pg_available")
+        || norm.contains("pg_is_in_recovery")
+        || norm.contains("pg_encoding_to_char")
+    {
+        return Some(empty_query_response());
+    }
+
+    // ── information_schema virtual tables ─────────────────────────────────
+    if norm.contains("information_schema.tables") {
+        return Some(information_schema_tables_response(&norm, db));
+    }
+    if norm.contains("information_schema.columns") {
+        return Some(information_schema_columns_response(&norm, db));
+    }
+    if norm.contains("information_schema.") {
+        return Some(empty_query_response());
+    }
+
+    // ── scalar connection functions ────────────────────────────────────────
+    if norm.contains("current_schema()") || norm == "select current_schema" {
+        return Some(single_text_row("current_schema", "public"));
+    }
+    if norm.contains("current_database()") {
+        return Some(single_text_row("current_database", "rustdb"));
+    }
+    if norm.contains("current_setting(") {
+        return Some(single_text_row("current_setting", ""));
+    }
+
+    // ── SELECT without FROM (scalar query) ────────────────────────────────
+    // Rust-DB's engine requires at least one FROM table. Intercept any
+    // SELECT that has no FROM clause (function calls already handled above).
+    // Use word-boundary check to handle newlines/tabs before FROM keyword.
+    let has_from_kw = norm.split_whitespace().any(|t| t == "from");
+    if norm.starts_with("select ") && !has_from_kw {
+        return Some(evaluate_scalar_select(&norm));
+    }
+
+    None
+}
+
+/// Evaluate a scalar SELECT with no FROM clause.
+/// Handles: `SELECT 1`, `SELECT 1 AS n`, `SELECT 'foo'`, `SELECT true`, `SELECT NULL`.
+fn evaluate_scalar_select<'a>(norm: &str) -> Response<'a> {
+    let rest = norm["select ".len()..].trim();
+
+    // Parse: <expr> [AS <alias>]
+    let (expr_raw, alias) = if let Some(pos) = rest.find(" as ") {
+        (rest[..pos].trim(), rest[pos + 4..].trim())
+    } else {
+        (rest.trim(), "?column?")
+    };
+
+    // Integer literal — encode as TEXT to avoid binary-format issues with asyncpg.
+    if let Ok(n) = expr_raw.parse::<i64>() {
+        let fields = vec![FieldInfo::new(alias.to_string(), None, None, Type::TEXT, FieldFormat::Text)];
+        let schema = Arc::new(fields);
+        let ns = n.to_string();
+        let mut encoder = DataRowEncoder::new(schema.clone());
+        let _ = encoder.encode_field(&Some(ns.as_str()));
+        return Response::Query(QueryResponse::new(schema, stream::iter(vec![encoder.finish()])));
+    }
+    // Float literal
+    if let Ok(f) = expr_raw.parse::<f64>() {
+        let fields = vec![FieldInfo::new(alias.to_string(), None, None, Type::TEXT, FieldFormat::Text)];
+        let schema = Arc::new(fields);
+        let fs = f.to_string();
+        let mut encoder = DataRowEncoder::new(schema.clone());
+        let _ = encoder.encode_field(&Some(fs.as_str()));
+        return Response::Query(QueryResponse::new(schema, stream::iter(vec![encoder.finish()])));
+    }
+    // Boolean
+    if expr_raw == "true" { return single_bool_row(alias, true); }
+    if expr_raw == "false" { return single_bool_row(alias, false); }
+    // NULL
+    if expr_raw == "null" {
+        let fields = vec![FieldInfo::new(alias.to_string(), None, None, Type::TEXT, FieldFormat::Text)];
+        let schema = Arc::new(fields);
+        let mut encoder = DataRowEncoder::new(schema.clone());
+        let _ = encoder.encode_field(&None::<&str>);
+        return Response::Query(QueryResponse::new(schema, stream::iter(vec![encoder.finish()])));
+    }
+    // Quoted string: 'foo' or "foo"
+    if (expr_raw.starts_with('\'') && expr_raw.ends_with('\''))
+        || (expr_raw.starts_with('"') && expr_raw.ends_with('"'))
+    {
+        let val = &expr_raw[1..expr_raw.len() - 1];
+        return single_text_row(alias, val);
+    }
+    // Unknown expression: return a NULL text row rather than erroring.
+    let fields = vec![FieldInfo::new(alias.to_string(), None, None, Type::TEXT, FieldFormat::Text)];
+    let schema = Arc::new(fields);
+    let mut encoder = DataRowEncoder::new(schema.clone());
+    let _ = encoder.encode_field(&None::<&str>);
+    Response::Query(QueryResponse::new(schema, stream::iter(vec![encoder.finish()])))
+}
+
+/// Return only the column schema for an intercepted system query — no rows.
+/// Must be exactly consistent with what `intercept_system_query` produces.
+/// Returns `Some(fields)` (possibly empty) when intercepted, `None` otherwise.
+fn field_info_for_intercept(sql: &str, db: &Database) -> Option<Vec<FieldInfo>> {
+    let norm = sql.trim().to_lowercase();
+
+    // Control commands → no result columns.
+    if norm.starts_with("set ") || norm == "set"
+        || norm.starts_with("reset ") || norm == "reset"
+        || norm.starts_with("discard ") || norm == "discard"
+        || norm.starts_with("deallocate ") || norm == "deallocate"
+    {
+        return Some(vec![]);
+    }
+
+    // SHOW → 1 text column named after the parameter.
+    if norm.starts_with("show ") {
+        let param = norm["show ".len()..].trim().to_string();
+        return Some(vec![FieldInfo::new(param, None, None, Type::TEXT, FieldFormat::Text)]);
+    }
+
+    if norm.contains("version()") {
+        return Some(vec![FieldInfo::new("version".into(), None, None, Type::TEXT, FieldFormat::Text)]);
+    }
+
+    // pg_class relname query (table existence check) — returns 1 relname column.
+    if (norm.contains("pg_class") || norm.contains("pg_catalog."))
+        && norm.contains("relname")
+        && norm.starts_with("select")
+    {
+        return Some(vec![FieldInfo::new("relname".into(), None, None, Type::TEXT, FieldFormat::Text)]);
+    }
+
+    if norm.contains("pg_catalog.")
+        || norm.contains("pg_type")
+        || norm.contains("pg_namespace")
+        || norm.contains("pg_class")
+        || norm.contains("pg_attribute")
+        || norm.contains("pg_index")
+        || norm.contains("pg_constraint")
+        || norm.contains("pg_description")
+        || norm.contains("pg_statistic")
+        || norm.contains("pg_available")
+        || norm.contains("pg_is_in_recovery")
+        || norm.contains("pg_encoding_to_char")
+    {
+        return Some(vec![]);
+    }
+
+    if norm.contains("information_schema.tables") {
+        if norm.trim_start().starts_with("select exists") {
+            return Some(vec![FieldInfo::new("exists".into(), None, None, Type::TEXT, FieldFormat::Text)]);
+        }
+        return Some(vec![
+            FieldInfo::new("table_catalog".into(), None, None, Type::TEXT, FieldFormat::Text),
+            FieldInfo::new("table_schema".into(),  None, None, Type::TEXT, FieldFormat::Text),
+            FieldInfo::new("table_name".into(),    None, None, Type::TEXT, FieldFormat::Text),
+            FieldInfo::new("table_type".into(),    None, None, Type::TEXT, FieldFormat::Text),
+        ]);
+    }
+    if norm.contains("information_schema.columns") {
+        // All TEXT — avoids binary-format decoding issues with asyncpg.
+        return Some(vec![
+            FieldInfo::new("table_name".into(),               None, None, Type::TEXT, FieldFormat::Text),
+            FieldInfo::new("column_name".into(),              None, None, Type::TEXT, FieldFormat::Text),
+            FieldInfo::new("ordinal_position".into(),         None, None, Type::TEXT, FieldFormat::Text),
+            FieldInfo::new("column_default".into(),           None, None, Type::TEXT, FieldFormat::Text),
+            FieldInfo::new("is_nullable".into(),              None, None, Type::TEXT, FieldFormat::Text),
+            FieldInfo::new("data_type".into(),                None, None, Type::TEXT, FieldFormat::Text),
+            FieldInfo::new("character_maximum_length".into(), None, None, Type::TEXT, FieldFormat::Text),
+            FieldInfo::new("numeric_precision".into(),        None, None, Type::TEXT, FieldFormat::Text),
+            FieldInfo::new("numeric_scale".into(),            None, None, Type::TEXT, FieldFormat::Text),
+        ]);
+    }
+    if norm.contains("information_schema.") {
+        return Some(vec![]);
+    }
+
+    if norm.contains("current_schema()") || norm == "select current_schema" {
+        return Some(vec![FieldInfo::new("current_schema".into(), None, None, Type::TEXT, FieldFormat::Text)]);
+    }
+    if norm.contains("current_database()") {
+        return Some(vec![FieldInfo::new("current_database".into(), None, None, Type::TEXT, FieldFormat::Text)]);
+    }
+    if norm.contains("current_setting(") {
+        return Some(vec![FieldInfo::new("current_setting".into(), None, None, Type::TEXT, FieldFormat::Text)]);
+    }
+
+    // Scalar SELECT without FROM — mirror evaluate_scalar_select's column logic.
+    // Use word-boundary check to handle newlines/tabs before FROM.
+    let has_from = norm.split_whitespace().any(|t| t == "from");
+    if norm.starts_with("select ") && !has_from {
+        let rest = norm["select ".len()..].trim().to_string();
+        let (expr_raw, alias) = if let Some(pos) = rest.find(" as ") {
+            (rest[..pos].trim().to_string(), rest[pos + 4..].trim().to_string())
+        } else {
+            (rest.trim().to_string(), "?column?".to_string())
+        };
+        // All TEXT — avoids binary-format decoding issues with asyncpg.
+        return Some(vec![FieldInfo::new(alias, None, None, Type::TEXT, FieldFormat::Text)]);
+    }
+
+    None
+}
+
 /// Parse SQL to determine result columns for Describe responses.
 /// Returns FieldInfo entries for SELECT / RETURNING queries, empty for DML without RETURNING.
 fn describe_sql_columns(sql: &str, db: &Database) -> Vec<FieldInfo> {
@@ -341,6 +842,15 @@ fn describe_sql_columns(sql: &str, db: &Database) -> Vec<FieldInfo> {
         s
     };
 
+    // Strip ::type casts so the parser and engine accept SQLAlchemy/asyncpg SQL.
+    let sanitized = preprocess_sql(&sanitized);
+
+    // Check intercept layer first — before the SQL parser, so system catalog
+    // queries that sqlparser can't parse still get the right column schema.
+    if let Some(fields) = field_info_for_intercept(&sanitized, db) {
+        return fields;
+    }
+
     let stmts = match Parser::parse_sql(&GenericDialect {}, &sanitized) {
         Ok(s) => s,
         Err(_) => return vec![],
@@ -358,8 +868,14 @@ fn describe_sql_columns(sql: &str, db: &Database) -> Vec<FieldInfo> {
                         .iter()
                         .enumerate()
                         .map(|(i, name)| {
+                            // Strip table prefix to match PostgreSQL RowDescription convention.
+                            let display_name = if let Some(pos) = name.rfind('.') {
+                                name[pos+1..].to_string()
+                            } else {
+                                name.clone()
+                            };
                             let pg_type = column_types.get(i).map(value_type_to_pg_type).unwrap_or(Type::TEXT);
-                            FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
+                            FieldInfo::new(display_name, None, None, pg_type, FieldFormat::Text)
                         })
                         .collect()
                 }
@@ -433,6 +949,109 @@ fn describe_returning_columns(
 // Extended query protocol (parameterized queries)
 // ---------------------------------------------------------------------------
 
+/// Map a SQL type name to a pgwire Type.
+fn sql_type_name_to_pg_type(name: &str) -> Type {
+    match name.trim().to_lowercase().as_str() {
+        "varchar" | "character varying" | "text" | "char" | "bpchar" => Type::TEXT,
+        "int" | "integer" | "int4" => Type::INT4,
+        "bigint" | "int8" => Type::INT8,
+        "smallint" | "int2" => Type::INT2,
+        "float" | "float4" | "real" => Type::FLOAT4,
+        "double precision" | "float8" => Type::FLOAT8,
+        "bool" | "boolean" => Type::BOOL,
+        "timestamp with time zone" | "timestamptz" => Type::TIMESTAMPTZ,
+        "timestamp" | "timestamp without time zone" => Type::TIMESTAMP,
+        "date" => Type::DATE,
+        "uuid" => Type::UUID,
+        "json" | "jsonb" => Type::TEXT,
+        "bytea" => Type::BYTEA,
+        "numeric" | "decimal" => Type::NUMERIC,
+        _ => Type::TEXT,
+    }
+}
+
+/// Scan SQL for `$N::TYPENAME` patterns and return a Vec<Type> indexed by parameter position.
+/// Returns a Vec of length = max($N) with TEXT as default for untyped params.
+fn infer_param_types(sql: &str) -> Vec<Type> {
+    let mut types: std::collections::HashMap<usize, Type> = std::collections::HashMap::new();
+    let lower = sql.to_lowercase();
+    let bytes = lower.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                if bytes[i] == b'\\' { i += 1; }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'$' {
+            i += 1;
+            let num_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > num_start {
+                if let Ok(n) = lower[num_start..i].parse::<usize>() {
+                    // Check for ::TYPENAME after the parameter number
+                    let mut j = i;
+                    while j < bytes.len() && bytes[j] == b' ' { j += 1; }
+                    if j + 1 < bytes.len() && bytes[j] == b':' && bytes[j + 1] == b':' {
+                        j += 2;
+                        while j < bytes.len() && bytes[j] == b' ' { j += 1; }
+                        let type_start = j;
+                        // Read until a non-type character
+                        while j < bytes.len() && !matches!(bytes[j], b',' | b')' | b' ' | b'\n' | b'\r' | b'\t' | b'[' | b'=' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'|' | b'&') {
+                            j += 1;
+                        }
+                        // Also check for "double precision", "character varying", "timestamp with time zone"
+                        let mut type_name = lower[type_start..j].to_string();
+                        // Handle multi-word types by consuming extra words
+                        if type_name == "timestamp" || type_name == "character" || type_name == "double" {
+                            while j < bytes.len() && bytes[j] == b' ' { j += 1; }
+                            let word2_start = j;
+                            while j < bytes.len() && bytes[j].is_ascii_alphabetic() { j += 1; }
+                            if j > word2_start {
+                                let w2 = &lower[word2_start..j];
+                                type_name = format!("{} {}", type_name, w2);
+                                // For "timestamp with time zone"
+                                if type_name == "timestamp with" {
+                                    while j < bytes.len() && bytes[j] == b' ' { j += 1; }
+                                    let w3s = j;
+                                    while j < bytes.len() && bytes[j].is_ascii_alphabetic() { j += 1; }
+                                    let w4s = j;
+                                    while j < bytes.len() && bytes[j] == b' ' { j += 1; }
+                                    let w4e = j;
+                                    while j < bytes.len() && bytes[j].is_ascii_alphabetic() { j += 1; }
+                                    let w3 = &lower[w3s..w4s.min(lower.len())];
+                                    let w4 = if w4e < lower.len() { &lower[w4e..j] } else { "" };
+                                    if !w3.is_empty() {
+                                        type_name = format!("{} {} {}", type_name, w3, w4).trim().to_string();
+                                    }
+                                }
+                            }
+                        }
+                        types.insert(n, sql_type_name_to_pg_type(&type_name));
+                    } else {
+                        types.entry(n).or_insert(Type::TEXT);
+                    }
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    if types.is_empty() {
+        return vec![];
+    }
+    let max_n = *types.keys().max().unwrap_or(&0);
+    (1..=max_n)
+        .map(|n| types.get(&n).cloned().unwrap_or(Type::TEXT))
+        .collect()
+}
+
 /// Query parser that stores SQL as a plain string.
 struct DbQueryParser;
 
@@ -465,7 +1084,11 @@ impl DbExtendedQueryHandler {
     }
 
     fn execute_one<'a>(&self, sql: &str) -> Result<Response<'a>, Box<dyn std::error::Error>> {
-        let result = self.db.execute_sql(sql)?;
+        let preprocessed = preprocess_sql(sql);
+        if let Some(intercepted) = intercept_system_query(&preprocessed, &self.db) {
+            return Ok(intercepted);
+        }
+        let result = self.db.execute_sql(&preprocessed)?;
         execute_sql_result(result, &self.state, &self.db)
     }
 }
@@ -666,7 +1289,13 @@ impl ExtendedQueryHandler for DbExtendedQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let fields = describe_sql_columns(&target.statement, &self.db);
-        Ok(DescribeStatementResponse::new(target.parameter_types.clone(), fields))
+        // If asyncpg sent no type OIDs in Parse, infer types from $N::TYPE casts.
+        let params = if target.parameter_types.is_empty() {
+            infer_param_types(&target.statement)
+        } else {
+            target.parameter_types.clone()
+        };
+        Ok(DescribeStatementResponse::new(params, fields))
     }
 
     async fn do_describe_portal<C>(
@@ -692,7 +1321,7 @@ impl ExtendedQueryHandler for DbExtendedQueryHandler {
 struct DbHandlerFactory {
     db: Database,
     next_conn_id: Arc<AtomicU64>,
-    auth: Option<Arc<AuthManager>>,
+    auth: Option<Arc<Mutex<AuthManager>>>,
 }
 
 impl PgWireHandlerFactory for DbHandlerFactory {
@@ -747,7 +1376,7 @@ async fn main() {
             let mut mgr = AuthManager::new();
             mgr.add_user(user, password);
             info!(user = %user, "authentication enabled");
-            Some(Arc::new(mgr))
+            Some(Arc::new(Mutex::new(mgr)))
         }
         (Some(_), None) => {
             error!("--user requires --password");
@@ -773,6 +1402,23 @@ async fn main() {
     };
 
     info!(tables = db.table_count().unwrap_or(0), "database opened, WAL recovery complete");
+
+    // Start web UI server.
+    let web_state = web::AppState {
+        db: db.clone(),
+        auth: auth.clone(),
+        sessions: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+    };
+    let web_addr = format!("{}:{}", args.bind, args.web_port);
+    let web_router = web::router(web_state);
+    let web_listener = tokio::net::TcpListener::bind(&web_addr)
+        .await
+        .expect("failed to bind web port");
+    info!(addr = %web_addr, "web UI available");
+
+    tokio::spawn(async move {
+        axum::serve(web_listener, web_router).await.ok();
+    });
 
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");

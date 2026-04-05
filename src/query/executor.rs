@@ -32,11 +32,12 @@ pub fn execute(plan: &LogicalPlan, input: Vec<Row>) -> Vec<Row> {
                 .map(|row| {
                     let mut projected = BTreeMap::new();
                     for col in columns {
-                        if let Some(val) = row.get(col) {
-                            projected.insert(col.clone(), val.clone());
-                        } else {
-                            projected.insert(col.clone(), Value::Null);
-                        }
+                        // Try qualified name; fall back to unqualified (strip table prefix).
+                        let val = row.get(col)
+                            .or_else(|| col.rfind('.').and_then(|p| row.get(&col[p + 1..])))
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        projected.insert(col.clone(), val);
                     }
                     projected
                 })
@@ -47,8 +48,9 @@ pub fn execute(plan: &LogicalPlan, input: Vec<Row>) -> Vec<Row> {
             let mut rows = execute(child, input);
             rows.sort_by(|a, b| {
                 for (col, order) in keys {
-                    let av = a.get(col).unwrap_or(&Value::Null);
-                    let bv = b.get(col).unwrap_or(&Value::Null);
+                    let unq = col.rfind('.').map(|p| &col[p + 1..]);
+                    let av = a.get(col).or_else(|| unq.and_then(|u| a.get(u))).unwrap_or(&Value::Null);
+                    let bv = b.get(col).or_else(|| unq.and_then(|u| b.get(u))).unwrap_or(&Value::Null);
                     let cmp = value_cmp(av, bv);
                     let cmp = if matches!(order, SortOrder::Desc) {
                         cmp.reverse()

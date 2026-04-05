@@ -57,6 +57,18 @@ impl AuthManager {
     pub fn get_cleartext(&self, username: &str) -> Option<&str> {
         self.cleartext.get(username).map(|s| s.as_str())
     }
+
+    /// Returns a list of all usernames.
+    pub fn list_users(&self) -> Vec<&str> {
+        self.hashes.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// Remove a user. Returns true if the user existed.
+    pub fn remove_user(&mut self, username: &str) -> bool {
+        let removed = self.hashes.remove(username).is_some();
+        self.cleartext.remove(username);
+        removed
+    }
 }
 
 impl Default for AuthManager {

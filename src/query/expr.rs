@@ -588,7 +588,17 @@ impl Expr {
     /// Evaluate the expression against a row, returning a Value.
     pub fn eval(&self, row: &Row) -> Value {
         match self {
-            Expr::Col(name) => row.get(name).cloned().unwrap_or(Value::Null),
+            Expr::Col(name) => {
+                // Try qualified name first; fall back to stripping table prefix.
+                // e.g. "devices.status" → try "devices.status", then "status".
+                if let Some(v) = row.get(name) {
+                    v.clone()
+                } else if let Some(dot) = name.rfind('.') {
+                    row.get(&name[dot + 1..]).cloned().unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                }
+            }
             Expr::Lit(v) => v.clone(),
             Expr::Eq(l, r) => Value::Bool(l.eval(row) == r.eval(row)),
             Expr::Lt(l, r) => {
