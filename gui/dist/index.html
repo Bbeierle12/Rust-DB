@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rust-DB Console</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Debug bar (always visible, shows last handler events) -->
+        <div id="debug-bar" style="position: fixed; top: 0; left: 0; right: 0; background: #1e2130; color: #e1e4ed; font-family: monospace; font-size: 11px; padding: 6px 10px; border-bottom: 1px solid #3b82f6; z-index: 9999; max-height: 120px; overflow-y: auto; white-space: pre-wrap;">[debug] loading…</div>
+
+        <!-- Connection picker (Tauri only) -->
+        <div id="connection-screen" class="screen" hidden>
+            <div class="login-card conn-card">
+                <div class="login-logo">
+                    <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+                        <rect width="48" height="48" rx="12" fill="#3b82f6"/>
+                        <path d="M14 16h20v4H14zm0 6h20v4H14zm0 6h20v4H14z" fill="#fff" opacity="0.9"/>
+                    </svg>
+                    <h1>Rust-DB</h1>
+                </div>
+
+                <div id="conn-error" class="error-msg" hidden></div>
+
+                <div id="conn-list-view">
+                    <div class="conn-header">
+                        <span class="muted">Connections</span>
+                        <button id="conn-add-btn" class="btn btn-sm">+ New</button>
+                    </div>
+                    <ul id="conn-list"></ul>
+                    <div id="conn-empty" class="empty-state" hidden>
+                        <p>No saved connections.</p>
+                        <button id="conn-add-empty-btn" class="btn btn-primary">Add Connection</button>
+                    </div>
+                </div>
+
+                <form id="conn-form" hidden>
+                    <div class="form-group">
+                        <label for="conn-name">Name</label>
+                        <input type="text" id="conn-name" placeholder="Local" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="conn-host">Host</label>
+                        <input type="text" id="conn-host" value="127.0.0.1" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="conn-port">Port</label>
+                        <input type="text" id="conn-port" value="8085" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-full">Save &amp; Connect</button>
+                    <button type="button" id="conn-cancel" class="btn btn-full" style="margin-top: 8px;">Cancel</button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Login screen -->
+        <div id="login-screen" class="screen" hidden>
+            <div class="login-card">
+                <div class="login-logo">
+                    <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+                        <rect width="48" height="48" rx="12" fill="#3b82f6"/>
+                        <path d="M14 16h20v4H14zm0 6h20v4H14zm0 6h20v4H14z" fill="#fff" opacity="0.9"/>
+                    </svg>
+                    <h1>Rust-DB</h1>
+                </div>
+                <form id="login-form">
+                    <div class="form-group">
+                        <label for="login-user">Username</label>
+                        <input type="text" id="login-user" autocomplete="username" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="login-pass">Password</label>
+                        <input type="password" id="login-pass" autocomplete="current-password" required>
+                    </div>
+                    <div id="login-error" class="error-msg" hidden></div>
+                    <button type="submit" id="auth-submit" class="btn btn-primary btn-full">Sign In</button>
+                </form>
+                <div id="auth-toggle" class="auth-toggle">
+                    <span id="auth-toggle-text">Don't have an account?</span>
+                    <a href="#" id="auth-toggle-link">Sign Up</a>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main app -->
+        <div id="main-app" class="screen" hidden>
+            <nav id="sidebar">
+                <div class="sidebar-header">
+                    <svg width="28" height="28" viewBox="0 0 48 48" fill="none">
+                        <rect width="48" height="48" rx="12" fill="#3b82f6"/>
+                        <path d="M14 16h20v4H14zm0 6h20v4H14zm0 6h20v4H14z" fill="#fff" opacity="0.9"/>
+                    </svg>
+                    <span class="sidebar-title">Rust-DB</span>
+                </div>
+                <ul class="nav-list">
+                    <li><a href="#" data-page="dashboard" class="nav-link active">
+                        <span class="nav-icon">&#9632;</span> Dashboard
+                    </a></li>
+                    <li><a href="#" data-page="query" class="nav-link">
+                        <span class="nav-icon">&#9654;</span> SQL Console
+                    </a></li>
+                    <li><a href="#" data-page="users" class="nav-link">
+                        <span class="nav-icon">&#9679;</span> Users
+                    </a></li>
+                </ul>
+                <div class="sidebar-footer">
+                    <div class="user-info">
+                        <span id="current-user"></span>
+                        <span id="current-conn" class="muted" hidden></span>
+                    </div>
+                    <div style="display: flex; gap: 4px;">
+                        <button id="switch-conn-btn" class="btn btn-sm" hidden title="Switch connection">&#8644;</button>
+                        <button id="logout-btn" class="btn btn-sm">Sign Out</button>
+                    </div>
+                </div>
+            </nav>
+
+            <main id="content">
+                <!-- Dashboard -->
+                <div id="page-dashboard" class="page">
+                    <div class="page-header">
+                        <h2>Tables</h2>
+                        <button id="refresh-tables" class="btn btn-sm">Refresh</button>
+                    </div>
+                    <div id="tables-grid" class="table-grid"></div>
+                    <div id="tables-empty" class="empty-state" hidden>
+                        <p>No tables yet. Use the SQL Console to create one.</p>
+                    </div>
+                </div>
+
+                <!-- Table detail -->
+                <div id="page-table" class="page" hidden>
+                    <div class="page-header">
+                        <button id="back-to-dashboard" class="btn btn-sm">&larr; Back</button>
+                        <h2 id="table-name"></h2>
+                    </div>
+                    <div class="table-meta">
+                        <div id="table-schema" class="schema-panel"></div>
+                        <div id="table-indexes" class="indexes-panel"></div>
+                    </div>
+                    <div class="data-controls">
+                        <span id="data-info"></span>
+                        <div class="pagination">
+                            <button id="data-prev" class="btn btn-sm" disabled>&larr; Prev</button>
+                            <button id="data-next" class="btn btn-sm">Next &rarr;</button>
+                        </div>
+                    </div>
+                    <div id="table-data" class="data-table-wrap"></div>
+                </div>
+
+                <!-- SQL Console -->
+                <div id="page-query" class="page" hidden>
+                    <div class="page-header">
+                        <h2>SQL Console</h2>
+                    </div>
+                    <div class="query-editor">
+                        <textarea id="sql-input" placeholder="SELECT * FROM my_table;" spellcheck="false"></textarea>
+                        <div class="query-actions">
+                            <button id="run-query" class="btn btn-primary">Execute</button>
+                            <button id="clear-query" class="btn btn-sm">Clear</button>
+                            <span id="query-status"></span>
+                        </div>
+                    </div>
+                    <div id="query-error" class="error-msg" hidden></div>
+                    <div id="query-result" class="data-table-wrap"></div>
+                    <div id="query-message" class="success-msg" hidden></div>
+                    <div class="query-history-section">
+                        <h3>History</h3>
+                        <ul id="query-history"></ul>
+                    </div>
+                </div>
+
+                <!-- Users -->
+                <div id="page-users" class="page" hidden>
+                    <div class="page-header">
+                        <h2>Users</h2>
+                    </div>
+                    <div id="users-disabled" hidden>
+                        <p class="muted">Authentication is not enabled on this server.</p>
+                    </div>
+                    <div id="users-enabled">
+                        <div class="add-user-form">
+                            <input type="text" id="new-user-name" placeholder="Username">
+                            <input type="password" id="new-user-pass" placeholder="Password">
+                            <button id="add-user-btn" class="btn btn-primary btn-sm">Add User</button>
+                        </div>
+                        <div id="user-error" class="error-msg" hidden></div>
+                        <table class="data-table" id="users-table">
+                            <thead><tr><th>Username</th><th>Actions</th></tr></thead>
+                            <tbody id="users-list"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>

@@ -12,6 +12,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::auth::AuthManager;
 use crate::engine::Database;
@@ -163,6 +164,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/users", get(list_users))
         .route("/api/users", post(create_user))
         .route("/api/users/{name}", delete(delete_user))
+        // Permissive CORS: API is intended to be reached from the Tauri
+        // desktop client (origin `tauri://localhost` / `http://tauri.localhost`)
+        // as well as the embedded browser UI. Bearer tokens travel in headers,
+        // not cookies, so credentialed CORS is not required.
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         .with_state(state)
 }
 
