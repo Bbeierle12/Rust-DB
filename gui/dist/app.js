@@ -92,9 +92,46 @@
 
     // Table detail pagination
     let tableOffset = 0;
-    const PAGE_SIZE = 100;
     let currentTable = '';
     let currentTableTotal = 0;
+
+    // -----------------------------------------------------------------------
+    // Settings (persisted in localStorage)
+    // -----------------------------------------------------------------------
+    const SETTINGS_KEY = 'rustdb_settings';
+    const SETTINGS_DEFAULTS = Object.freeze({
+        showDebug: false,
+        pageSize: 100,
+    });
+
+    function loadSettings() {
+        try {
+            const raw = localStorage.getItem(SETTINGS_KEY);
+            if (!raw) return { ...SETTINGS_DEFAULTS };
+            const parsed = JSON.parse(raw);
+            return { ...SETTINGS_DEFAULTS, ...parsed };
+        } catch {
+            return { ...SETTINGS_DEFAULTS };
+        }
+    }
+
+    function saveSettings() {
+        try {
+            localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+        } catch (_) { /* ignore */ }
+    }
+
+    function applySettings() {
+        const bar = (typeof document !== 'undefined') ? document.getElementById('debug-bar') : null;
+        if (bar) bar.hidden = !settings.showDebug;
+    }
+
+    const settings = loadSettings();
+    // PAGE_SIZE is read from settings wherever pagination happens.
+    function getPageSize() {
+        const n = parseInt(settings.pageSize, 10);
+        return Number.isFinite(n) && n >= 10 && n <= 1000 ? n : 100;
+    }
 
     // -----------------------------------------------------------------------
     // API client
@@ -305,7 +342,7 @@
         wrap.innerHTML = '<div class="muted">Loading...</div>';
 
         try {
-            const data = await api('GET', `/api/tables/${encodeURIComponent(currentTable)}/data?limit=${PAGE_SIZE}&offset=${tableOffset}`);
+            const data = await api('GET', `/api/tables/${encodeURIComponent(currentTable)}/data?limit=${getPageSize()}&offset=${tableOffset}`);
             currentTableTotal = data.total;
             renderDataTable(wrap, data.columns, data.rows);
             updatePagination();
@@ -315,12 +352,13 @@
     }
 
     function updatePagination() {
-        const end = Math.min(tableOffset + PAGE_SIZE, currentTableTotal);
+        const pageSize = getPageSize();
+        const end = Math.min(tableOffset + pageSize, currentTableTotal);
         $('#data-info').textContent = currentTableTotal === 0
             ? 'No rows'
             : `Showing ${tableOffset + 1}-${end} of ${currentTableTotal}`;
         $('#data-prev').disabled = tableOffset === 0;
-        $('#data-next').disabled = tableOffset + PAGE_SIZE >= currentTableTotal;
+        $('#data-next').disabled = tableOffset + pageSize >= currentTableTotal;
     }
 
     // -----------------------------------------------------------------------
@@ -357,12 +395,17 @@
     // SQL Console
     // -----------------------------------------------------------------------
 
+    // Most recent successful SELECT result, used by the export buttons.
+    let lastQueryResult = null;
+
     async function executeQuery() {
         const sql = $('#sql-input').value.trim();
         if (!sql) return;
 
         hide($('#query-error'));
         hide($('#query-message'));
+        hide($('#export-group'));
+        lastQueryResult = null;
         $('#query-result').innerHTML = '';
         $('#query-status').textContent = 'Executing...';
         $('#run-query').disabled = true;
@@ -379,6 +422,8 @@
             if (result.type === 'query' && result.rows) {
                 renderDataTable($('#query-result'), result.columns, result.rows);
                 $('#query-status').textContent = `${result.rows.length} row(s) in ${elapsed}ms`;
+                lastQueryResult = { columns: result.columns, rows: result.rows };
+                show($('#export-group'));
             } else if (result.message) {
                 const msg = $('#query-message');
                 msg.textContent = result.message;
@@ -397,6 +442,55 @@
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Result export (CSV / JSON)
+    // -----------------------------------------------------------------------
+
+    function csvEscape(val) {
+        if (val === null || val === undefined) return '';
+        const s = String(val);
+        if (/[",\n\r]/.test(s)) {
+            return '"' + s.replace(/"/g, '""') + '"';
+        }
+        return s;
+    }
+
+    function resultAsCsv(result) {
+        const { columns, rows } = result;
+        const lines = [columns.map(csvEscape).join(',')];
+        for (const row of rows) {
+            lines.push(columns.map(c => csvEscape(row[c])).join(','));
+        }
+        return lines.join('\n') + '\n';
+    }
+
+    function resultAsJson(result) {
+        return JSON.stringify(result.rows, null, 2);
+    }
+
+    function downloadBlob(content, filename, mimeType) {
+        const blob = new Blob([content], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        // Defer revoke so the webview has a chance to start the download.
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    function exportResult(kind) {
+        if (!lastQueryResult) return;
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        if (kind === 'csv') {
+            downloadBlob(resultAsCsv(lastQueryResult), `query_${stamp}.csv`, 'text/csv;charset=utf-8');
+        } else {
+            downloadBlob(resultAsJson(lastQueryResult), `query_${stamp}.json`, 'application/json;charset=utf-8');
+        }
+    }
+
     function addToHistory(sql) {
         // Remove duplicate if present
         queryHistory = queryHistory.filter(h => h !== sql);
@@ -411,6 +505,121 @@
         list.innerHTML = queryHistory.map((sql, i) =>
             `<li data-index="${i}" title="${escapeHtml(sql)}">${escapeHtml(sql)}</li>`
         ).join('');
+    }
+
+    // -----------------------------------------------------------------------
+    // Query tabs — multiple open SQL buffers, persisted in localStorage
+    // -----------------------------------------------------------------------
+
+    const TABS_KEY = 'rustdb_tabs';
+    let queryTabs = [];      // [{ id, sql }]
+    let activeTabId = null;
+
+    function loadTabs() {
+        try {
+            const raw = localStorage.getItem(TABS_KEY);
+            if (raw) {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed.tabs)) queryTabs = parsed.tabs;
+                if (typeof parsed.activeId === 'string') activeTabId = parsed.activeId;
+            }
+        } catch { /* ignore */ }
+        if (queryTabs.length === 0) {
+            queryTabs.push({ id: genId(), sql: '' });
+        }
+        if (!activeTabId || !queryTabs.find(t => t.id === activeTabId)) {
+            activeTabId = queryTabs[0].id;
+        }
+    }
+
+    function saveTabs() {
+        try {
+            localStorage.setItem(TABS_KEY, JSON.stringify({
+                tabs: queryTabs,
+                activeId: activeTabId,
+            }));
+        } catch { /* ignore */ }
+    }
+
+    function tabLabel(tab, index) {
+        const trimmed = (tab.sql || '').trim();
+        if (!trimmed) return `Query ${index + 1}`;
+        const firstLine = trimmed.split('\n')[0];
+        return firstLine.length > 28 ? firstLine.slice(0, 28) + '…' : firstLine;
+    }
+
+    function renderTabs() {
+        const container = $('#query-tabs-list');
+        if (!container) return;
+        container.innerHTML = queryTabs.map((t, i) => `
+            <div class="query-tab ${t.id === activeTabId ? 'active' : ''}" data-tab="${escapeHtml(t.id)}" title="${escapeHtml(tabLabel(t, i))}">
+                <span class="tab-title">${escapeHtml(tabLabel(t, i))}</span>
+                <button class="tab-close" data-close="${escapeHtml(t.id)}" title="Close tab">&times;</button>
+            </div>
+        `).join('');
+    }
+
+    // Save the current textarea into the active tab's sql field (without
+    // refreshing the UI — used in places where we're about to switch tabs).
+    function flushActiveTab() {
+        const tab = queryTabs.find(t => t.id === activeTabId);
+        if (tab) tab.sql = $('#sql-input').value;
+    }
+
+    function switchToTab(id) {
+        if (id === activeTabId) return;
+        flushActiveTab();
+        activeTabId = id;
+        const tab = queryTabs.find(t => t.id === id);
+        if (tab) $('#sql-input').value = tab.sql;
+        // Clear the result area when switching tabs — results belong to a
+        // specific query, not the editor buffer.
+        $('#query-result').innerHTML = '';
+        hide($('#query-error'));
+        hide($('#query-message'));
+        hide($('#export-group'));
+        lastQueryResult = null;
+        $('#query-status').textContent = '';
+        saveTabs();
+        renderTabs();
+    }
+
+    function newTab() {
+        flushActiveTab();
+        const tab = { id: genId(), sql: '' };
+        queryTabs.push(tab);
+        activeTabId = tab.id;
+        $('#sql-input').value = '';
+        $('#query-result').innerHTML = '';
+        hide($('#query-error'));
+        hide($('#query-message'));
+        hide($('#export-group'));
+        lastQueryResult = null;
+        $('#query-status').textContent = '';
+        saveTabs();
+        renderTabs();
+        $('#sql-input').focus();
+    }
+
+    function closeTab(id) {
+        const idx = queryTabs.findIndex(t => t.id === id);
+        if (idx === -1) return;
+        if (queryTabs.length === 1) {
+            // Never leave the user with zero tabs — clear the last one instead.
+            queryTabs[0].sql = '';
+            $('#sql-input').value = '';
+            saveTabs();
+            renderTabs();
+            return;
+        }
+        queryTabs.splice(idx, 1);
+        if (activeTabId === id) {
+            activeTabId = queryTabs[Math.min(idx, queryTabs.length - 1)].id;
+            const newActive = queryTabs.find(t => t.id === activeTabId);
+            if (newActive) $('#sql-input').value = newActive.sql;
+        }
+        saveTabs();
+        renderTabs();
     }
 
     // -----------------------------------------------------------------------
@@ -564,11 +773,11 @@
 
         // Table data pagination
         $('#data-prev').addEventListener('click', () => {
-            tableOffset = Math.max(0, tableOffset - PAGE_SIZE);
+            tableOffset = Math.max(0, tableOffset - getPageSize());
             loadTableData();
         });
         $('#data-next').addEventListener('click', () => {
-            tableOffset += PAGE_SIZE;
+            tableOffset += getPageSize();
             loadTableData();
         });
 
@@ -576,8 +785,13 @@
         $('#run-query').addEventListener('click', executeQuery);
         $('#clear-query').addEventListener('click', () => {
             $('#sql-input').value = '';
+            flushActiveTab();
+            saveTabs();
+            renderTabs();
             hide($('#query-error'));
             hide($('#query-message'));
+            hide($('#export-group'));
+            lastQueryResult = null;
             $('#query-result').innerHTML = '';
             $('#query-status').textContent = '';
         });
@@ -590,13 +804,48 @@
             }
         });
 
-        // Query history click
+        // Persist editor changes into the active tab and re-title it.
+        $('#sql-input').addEventListener('input', () => {
+            const tab = queryTabs.find(t => t.id === activeTabId);
+            if (tab) {
+                tab.sql = $('#sql-input').value;
+                saveTabs();
+                renderTabs();
+            }
+        });
+
+        // Tab bar — delegated click (switch vs close)
+        $('#query-tabs-list').addEventListener('click', (e) => {
+            const closeBtn = e.target.closest('.tab-close');
+            if (closeBtn) {
+                e.stopPropagation();
+                closeTab(closeBtn.dataset.close);
+                return;
+            }
+            const tabEl = e.target.closest('.query-tab');
+            if (tabEl) switchToTab(tabEl.dataset.tab);
+        });
+
+        // New tab button
+        $('#new-tab-btn').addEventListener('click', newTab);
+
+        // Export buttons
+        $('#export-csv').addEventListener('click', () => exportResult('csv'));
+        $('#export-json').addEventListener('click', () => exportResult('json'));
+
+        // Query history click — load into active tab
         $('#query-history').addEventListener('click', (e) => {
             const li = e.target.closest('li');
             if (li) {
                 const idx = parseInt(li.dataset.index);
                 if (queryHistory[idx]) {
                     $('#sql-input').value = queryHistory[idx];
+                    const tab = queryTabs.find(t => t.id === activeTabId);
+                    if (tab) {
+                        tab.sql = queryHistory[idx];
+                        saveTabs();
+                        renderTabs();
+                    }
                 }
             }
         });
@@ -827,6 +1076,137 @@
         showScreen('connection');
     }
 
+    // -----------------------------------------------------------------------
+    // Settings modal
+    // -----------------------------------------------------------------------
+
+    function openSettings() {
+        const modal = $('#settings-modal');
+        if (!modal) return;
+        // Sync form controls with current settings.
+        const chk = $('#setting-show-debug');
+        if (chk) chk.checked = !!settings.showDebug;
+        const ps = $('#setting-page-size');
+        if (ps) ps.value = String(getPageSize());
+        // Populate about section.
+        const connInfo = $('#settings-conn-info');
+        if (connInfo) {
+            connInfo.textContent = currentConnection
+                ? `${currentConnection.name} (${currentConnection.host}:${currentConnection.port})`
+                : (IS_TAURI ? 'Not connected' : 'Browser mode (same-origin)');
+        }
+        const rtInfo = $('#settings-runtime-info');
+        if (rtInfo) rtInfo.textContent = IS_TAURI ? 'Tauri desktop' : 'Web browser';
+        show(modal);
+        // Move focus into the modal for keyboard users.
+        const doneBtn = $('#settings-done');
+        if (doneBtn) doneBtn.focus();
+    }
+
+    function closeSettings() {
+        const modal = $('#settings-modal');
+        if (modal) hide(modal);
+    }
+
+    function toggleDebugBar() {
+        settings.showDebug = !settings.showDebug;
+        saveSettings();
+        applySettings();
+    }
+
+    function resetSettings() {
+        for (const k of Object.keys(SETTINGS_DEFAULTS)) {
+            settings[k] = SETTINGS_DEFAULTS[k];
+        }
+        saveSettings();
+        applySettings();
+        openSettings(); // re-sync the form controls
+    }
+
+    function bindSettingsEvents() {
+        const modal = $('#settings-modal');
+        if (!modal) return;
+
+        $('#settings-btn').addEventListener('click', openSettings);
+        $('#settings-close').addEventListener('click', closeSettings);
+        $('#settings-done').addEventListener('click', closeSettings);
+        $('#settings-reset').addEventListener('click', resetSettings);
+
+        $('#setting-show-debug').addEventListener('change', (e) => {
+            settings.showDebug = !!e.target.checked;
+            saveSettings();
+            applySettings();
+        });
+
+        $('#setting-page-size').addEventListener('change', (e) => {
+            const n = parseInt(e.target.value, 10);
+            if (Number.isFinite(n) && n >= 10 && n <= 1000) {
+                settings.pageSize = n;
+                saveSettings();
+            } else {
+                // Reject invalid input: snap back to the current value.
+                e.target.value = String(getPageSize());
+            }
+        });
+
+        // Click on overlay (not the inner modal) closes.
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) closeSettings();
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Global hotkeys
+    // -----------------------------------------------------------------------
+
+    function isTextInputTarget(el) {
+        if (!el) return false;
+        const tag = el.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+        if (el.isContentEditable) return true;
+        return false;
+    }
+
+    function bindHotkeys() {
+        document.addEventListener('keydown', (e) => {
+            const mod = e.ctrlKey || e.metaKey;
+
+            // Esc: close modal (always — even if focus is in an input)
+            if (e.key === 'Escape') {
+                const modal = $('#settings-modal');
+                if (modal && !modal.hidden) {
+                    e.preventDefault();
+                    closeSettings();
+                    return;
+                }
+            }
+
+            // Ctrl+, — open settings
+            if (mod && e.key === ',') {
+                e.preventDefault();
+                openSettings();
+                return;
+            }
+
+            // Ctrl+D — toggle debug bar (skip if user is typing in a field)
+            if (mod && (e.key === 'd' || e.key === 'D') && !isTextInputTarget(e.target)) {
+                e.preventDefault();
+                toggleDebugBar();
+                return;
+            }
+
+            // Ctrl+T — new query tab (only while on the SQL Console page)
+            if (mod && (e.key === 't' || e.key === 'T')) {
+                const queryPage = $('#page-query');
+                if (queryPage && !queryPage.hidden) {
+                    e.preventDefault();
+                    newTab();
+                    return;
+                }
+            }
+        });
+    }
+
     // Last-resort safety net: any unhandled async error in Tauri mode lands
     // in the connection error bar so failures are never invisible.
     if (IS_TAURI && typeof window !== 'undefined') {
@@ -855,13 +1235,21 @@
             show(connLabel);
             show($('#switch-conn-btn'));
         }
+        loadTabs();
+        // Populate the editor with the persisted active tab's content.
+        const activeTab = queryTabs.find(t => t.id === activeTabId);
+        if (activeTab) $('#sql-input').value = activeTab.sql;
+        renderTabs();
         navigateTo('dashboard');
         renderHistory();
     }
 
     async function init() {
         logDbg('init() start');
+        applySettings(); // honor showDebug before first paint
         bindEvents();
+        bindSettingsEvents();
+        bindHotkeys();
         logDbg('bindEvents done');
 
         if (IS_TAURI) {

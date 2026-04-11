@@ -111,6 +111,7 @@
                         <span id="current-conn" class="muted" hidden></span>
                     </div>
                     <div style="display: flex; gap: 4px;">
+                        <button id="settings-btn" class="btn btn-sm" title="Settings (Ctrl+,)">&#9881;</button>
                         <button id="switch-conn-btn" class="btn btn-sm" hidden title="Switch connection">&#8644;</button>
                         <button id="logout-btn" class="btn btn-sm">Sign Out</button>
                     </div>
@@ -155,11 +156,19 @@
                     <div class="page-header">
                         <h2>SQL Console</h2>
                     </div>
+                    <div class="query-tabs">
+                        <div id="query-tabs-list" class="query-tabs-list"></div>
+                        <button id="new-tab-btn" class="btn btn-sm" title="New query tab (Ctrl+T)">+</button>
+                    </div>
                     <div class="query-editor">
                         <textarea id="sql-input" placeholder="SELECT * FROM my_table;" spellcheck="false"></textarea>
                         <div class="query-actions">
                             <button id="run-query" class="btn btn-primary">Execute</button>
                             <button id="clear-query" class="btn btn-sm">Clear</button>
+                            <div id="export-group" class="export-group" hidden>
+                                <button id="export-csv" class="btn btn-sm">Export CSV</button>
+                                <button id="export-json" class="btn btn-sm">Export JSON</button>
+                            </div>
                             <span id="query-status"></span>
                         </div>
                     </div>
@@ -194,6 +203,63 @@
                     </div>
                 </div>
             </main>
+        </div>
+
+        <!-- Settings modal -->
+        <div id="settings-modal" class="modal-overlay" hidden>
+            <div class="modal" role="dialog" aria-labelledby="settings-title" aria-modal="true">
+                <div class="modal-header">
+                    <h2 id="settings-title">Settings</h2>
+                    <button id="settings-close" class="btn btn-sm" aria-label="Close">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <div class="settings-section">
+                        <h3>Display</h3>
+                        <div class="settings-row">
+                            <label for="setting-show-debug">Show debug bar</label>
+                            <label class="toggle"><input type="checkbox" id="setting-show-debug"><span class="toggle-slider"></span></label>
+                        </div>
+                        <div class="settings-row">
+                            <label for="setting-page-size">Table page size</label>
+                            <input type="number" id="setting-page-size" min="10" max="1000" step="10" style="width: 100px;">
+                        </div>
+                    </div>
+
+                    <div class="settings-section">
+                        <h3>Keyboard shortcuts</h3>
+                        <table class="shortcuts-table">
+                            <tbody>
+                                <tr><td>Open settings</td><td><kbd>Ctrl</kbd>+<kbd>,</kbd></td></tr>
+                                <tr><td>Toggle debug bar</td><td><kbd>Ctrl</kbd>+<kbd>D</kbd></td></tr>
+                                <tr><td>Open developer tools</td><td><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd></td></tr>
+                                <tr><td>Close dialog</td><td><kbd>Esc</kbd></td></tr>
+                                <tr><td>Run SQL query</td><td><kbd>Ctrl</kbd>+<kbd>Enter</kbd></td></tr>
+                                <tr><td>New query tab</td><td><kbd>Ctrl</kbd>+<kbd>T</kbd></td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <div class="settings-section">
+                        <h3>About</h3>
+                        <div class="settings-row">
+                            <label>Version</label>
+                            <span class="muted">Rust-DB GUI 0.1.0</span>
+                        </div>
+                        <div class="settings-row">
+                            <label>Connection</label>
+                            <span id="settings-conn-info" class="muted">—</span>
+                        </div>
+                        <div class="settings-row">
+                            <label>Runtime</label>
+                            <span id="settings-runtime-info" class="muted">—</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button id="settings-reset" class="btn btn-sm">Reset defaults</button>
+                    <button id="settings-done" class="btn btn-primary btn-sm">Done</button>
+                </div>
+            </div>
         </div>
     </div>
     <script src="app.js"></script>
