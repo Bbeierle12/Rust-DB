@@ -6,6 +6,8 @@
 //! — users upgrade by setting their password again.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
+use std::time::{Duration, Instant};
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -14,12 +16,43 @@ use rand::rngs::OsRng;
 const LEGACY_PREFIX: &str = "hash:";
 const ARGON2_PREFIX: &str = "argon2:";
 
-/// Manages user credentials.
+/// Default brute-force threshold: 10 failures within `DEFAULT_FAILURE_WINDOW`.
+pub const DEFAULT_FAILURE_THRESHOLD: u32 = 10;
+/// Default sliding window for counting consecutive failures.
+pub const DEFAULT_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// Default lockout duration once threshold is reached.
+pub const DEFAULT_LOCKOUT_DURATION: Duration = Duration::from_secs(300);
+
+/// Outcome of an authentication attempt with rate-limit awareness.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AuthOutcome {
+    /// Credentials matched.
+    Success,
+    /// Bad username or wrong password.
+    WrongPassword,
+    /// Peer is in the lockout window after too many recent failures.
+    LockedOut,
+}
+
+#[derive(Debug, Clone)]
+struct FailedAttempts {
+    count: u32,
+    first_at: Instant,
+    locked_until: Option<Instant>,
+}
+
+/// Manages user credentials and per-peer brute-force protection.
 pub struct AuthManager {
     /// username -> hashed password (for `authenticate()`)
     hashes: BTreeMap<String, String>,
     /// username -> cleartext password (for pgwire `AuthSource`)
     cleartext: BTreeMap<String, String>,
+    /// Per-peer-IP rate-limit state. Loopback peers are never tracked.
+    failures: BTreeMap<IpAddr, FailedAttempts>,
+    /// Failures within `failure_window` that trigger a lockout.
+    failure_threshold: u32,
+    failure_window: Duration,
+    lockout: Duration,
 }
 
 impl AuthManager {
@@ -27,7 +60,19 @@ impl AuthManager {
         Self {
             hashes: BTreeMap::new(),
             cleartext: BTreeMap::new(),
+            failures: BTreeMap::new(),
+            failure_threshold: DEFAULT_FAILURE_THRESHOLD,
+            failure_window: DEFAULT_FAILURE_WINDOW,
+            lockout: DEFAULT_LOCKOUT_DURATION,
         }
+    }
+
+    /// Override rate-limit parameters. `threshold` of 0 disables the limit
+    /// entirely. Used by tests; production uses defaults.
+    pub fn set_rate_limit(&mut self, threshold: u32, window: Duration, lockout: Duration) {
+        self.failure_threshold = threshold;
+        self.failure_window = window;
+        self.lockout = lockout;
     }
 
     /// Add a user with a plaintext password.
@@ -43,14 +88,78 @@ impl AuthManager {
             .insert(username.to_string(), password.to_string());
     }
 
-    /// Authenticate a user by username and plaintext password.
-    /// Supports both the modern argon2id format and the legacy CRC32 format.
+    /// Authenticate a user by username and plaintext password without
+    /// rate-limit tracking. Supports both the modern argon2id format and the
+    /// legacy CRC32 format.
     pub fn authenticate(&self, username: &str, password: &str) -> bool {
         let stored = match self.hashes.get(username) {
             Some(h) => h,
             None => return false,
         };
         verify_password(username, password, stored)
+    }
+
+    /// Authenticate with per-peer brute-force protection. Loopback peers
+    /// (`127.0.0.0/8`, `::1`) bypass rate limiting so dev typos don't
+    /// self-lockout.
+    pub fn authenticate_with_peer(
+        &mut self,
+        username: &str,
+        password: &str,
+        peer: IpAddr,
+    ) -> AuthOutcome {
+        self.authenticate_at(username, password, peer, Instant::now())
+    }
+
+    /// Test-friendly variant taking an explicit `now` so the lockout window
+    /// can be exercised without sleeping.
+    pub fn authenticate_at(
+        &mut self,
+        username: &str,
+        password: &str,
+        peer: IpAddr,
+        now: Instant,
+    ) -> AuthOutcome {
+        let limited = self.failure_threshold > 0 && !peer.is_loopback();
+
+        if limited
+            && let Some(state) = self.failures.get(&peer)
+            && let Some(until) = state.locked_until
+            && now < until
+        {
+            return AuthOutcome::LockedOut;
+        }
+
+        let valid = matches!(
+            self.hashes.get(username),
+            Some(stored) if verify_password(username, password, stored)
+        );
+
+        if valid {
+            if limited {
+                self.failures.remove(&peer);
+            }
+            return AuthOutcome::Success;
+        }
+
+        if limited {
+            let entry = self.failures.entry(peer).or_insert(FailedAttempts {
+                count: 0,
+                first_at: now,
+                locked_until: None,
+            });
+            // Reset the window if the previous failure was long enough ago.
+            if now.duration_since(entry.first_at) > self.failure_window {
+                entry.count = 0;
+                entry.first_at = now;
+                entry.locked_until = None;
+            }
+            entry.count += 1;
+            if entry.count >= self.failure_threshold {
+                entry.locked_until = Some(now + self.lockout);
+            }
+        }
+        AuthOutcome::WrongPassword
     }
 
     /// Returns true if any users have been configured.
@@ -140,6 +249,91 @@ pub struct AuthConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn make_mgr(threshold: u32, lockout: Duration) -> AuthManager {
+        let mut mgr = AuthManager::new();
+        mgr.add_user("alice", "pw");
+        mgr.set_rate_limit(threshold, Duration::from_secs(60), lockout);
+        mgr
+    }
+
+    #[test]
+    fn rate_limit_locks_out_after_threshold() {
+        let mut mgr = make_mgr(3, Duration::from_secs(300));
+        let peer: IpAddr = Ipv4Addr::new(203, 0, 113, 9).into();
+        let now = Instant::now();
+
+        // 3 wrong attempts → lockout.
+        for _ in 0..3 {
+            assert_eq!(
+                mgr.authenticate_at("alice", "wrong", peer, now),
+                AuthOutcome::WrongPassword
+            );
+        }
+        // Even with the right password, peer is locked out.
+        assert_eq!(
+            mgr.authenticate_at("alice", "pw", peer, now),
+            AuthOutcome::LockedOut
+        );
+    }
+
+    #[test]
+    fn rate_limit_clears_after_lockout_window() {
+        let mut mgr = make_mgr(3, Duration::from_secs(300));
+        let peer: IpAddr = Ipv4Addr::new(203, 0, 113, 9).into();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            mgr.authenticate_at("alice", "wrong", peer, t0);
+        }
+        // After lockout expires, valid password is accepted again.
+        let later = t0 + Duration::from_secs(301);
+        assert_eq!(
+            mgr.authenticate_at("alice", "pw", peer, later),
+            AuthOutcome::Success
+        );
+    }
+
+    #[test]
+    fn rate_limit_resets_on_success() {
+        let mut mgr = make_mgr(5, Duration::from_secs(300));
+        let peer: IpAddr = Ipv4Addr::new(203, 0, 113, 9).into();
+        let now = Instant::now();
+        // 4 wrong, then a correct one — counter should clear.
+        for _ in 0..4 {
+            mgr.authenticate_at("alice", "wrong", peer, now);
+        }
+        assert_eq!(
+            mgr.authenticate_at("alice", "pw", peer, now),
+            AuthOutcome::Success
+        );
+        // 4 more wrong attempts must NOT lock out (counter was reset).
+        for _ in 0..4 {
+            assert_eq!(
+                mgr.authenticate_at("alice", "wrong", peer, now),
+                AuthOutcome::WrongPassword
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_bypasses_rate_limit() {
+        let mut mgr = make_mgr(2, Duration::from_secs(300));
+        let peer: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let now = Instant::now();
+        // 50 wrong attempts from loopback — never locks out.
+        for _ in 0..50 {
+            assert_eq!(
+                mgr.authenticate_at("alice", "wrong", peer, now),
+                AuthOutcome::WrongPassword
+            );
+        }
+        // Correct password still works.
+        assert_eq!(
+            mgr.authenticate_at("alice", "pw", peer, now),
+            AuthOutcome::Success
+        );
+    }
 
     #[test]
     fn argon2_hash_roundtrip() {

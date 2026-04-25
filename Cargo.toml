@@ -46,6 +46,7 @@ tower = { version = "0.5", features = ["util"] }
 rcgen = "0.13"
 tokio-postgres = "0.7"
 tokio-postgres-rustls = "0.13"
+libc = "0.2"
 
 [patch.crates-io]
 pgwire = { path = "vendor/pgwire" }

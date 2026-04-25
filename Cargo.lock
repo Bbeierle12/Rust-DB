@@ -1638,6 +1638,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "futures",
+ "libc",
  "pgwire",
  "pyo3",
  "rand 0.8.5",

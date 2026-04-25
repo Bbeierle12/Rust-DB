@@ -108,6 +108,16 @@ struct Args {
     /// Disable TLS even if the config file enables it.
     #[arg(long)]
     no_tls: bool,
+
+    /// Seconds to wait for in-flight connections to drain on SIGINT/SIGTERM
+    /// before forcing exit. 0 = exit immediately on signal.
+    #[arg(long)]
+    shutdown_grace: Option<u64>,
+
+    /// Maximum SQL statement runtime in seconds before the server returns a
+    /// "canceling statement due to timeout" error to the client. 0 = no limit.
+    #[arg(long)]
+    statement_timeout: Option<u64>,
 }
 
 /// TOML-deserialized config. Every field is optional so any subset can be set.
@@ -121,6 +131,8 @@ struct FileConfig {
     password: Option<String>,
     max_connections: Option<u64>,
     checkpoint_wal_bytes: Option<u64>,
+    shutdown_grace: Option<u64>,
+    statement_timeout: Option<u64>,
     tls: Option<FileTlsConfig>,
 }
 
@@ -152,6 +164,8 @@ struct ServerConfig {
     password: Option<String>,
     max_connections: u64,
     checkpoint_wal_bytes: u64,
+    shutdown_grace: u64,
+    statement_timeout: u64,
     tls: Option<ResolvedTls>,
 }
 
@@ -204,6 +218,11 @@ impl ServerConfig {
                 .checkpoint_wal_bytes
                 .or(file.checkpoint_wal_bytes)
                 .unwrap_or(rust_dst_db::engine::DEFAULT_CHECKPOINT_WAL_BYTES),
+            shutdown_grace: args.shutdown_grace.or(file.shutdown_grace).unwrap_or(30),
+            statement_timeout: args
+                .statement_timeout
+                .or(file.statement_timeout)
+                .unwrap_or(0),
             tls: resolve_tls(args, file.tls.as_ref())?,
         })
     }
@@ -357,22 +376,47 @@ impl StartupHandler for DbStartupHandler {
                 let pwd = pwd.into_password()?;
                 let login_info = LoginInfo::from_client_info(client);
                 let username = login_info.user().unwrap_or("");
+                let peer = client.socket_addr().ip();
 
-                if auth.lock().unwrap().authenticate(username, &pwd.password) {
-                    info!(user = username, "authentication successful");
-                    pgwire::api::auth::finish_authentication(client, self.params.as_ref()).await?;
-                } else {
-                    warn!(user = username, "authentication failed");
-                    let error_info = ErrorInfo::new(
-                        "FATAL".to_string(),
-                        "28P01".to_string(),
-                        "password authentication failed".to_string(),
-                    );
-                    let error = ErrorResponse::from(error_info);
-                    client
-                        .feed(PgWireBackendMessage::ErrorResponse(error))
-                        .await?;
-                    client.close().await?;
+                let outcome =
+                    auth.lock()
+                        .unwrap()
+                        .authenticate_with_peer(username, &pwd.password, peer);
+
+                use rust_dst_db::auth::AuthOutcome;
+                match outcome {
+                    AuthOutcome::Success => {
+                        info!(user = username, peer = %peer, "authentication successful");
+                        pgwire::api::auth::finish_authentication(client, self.params.as_ref())
+                            .await?;
+                    }
+                    AuthOutcome::WrongPassword => {
+                        warn!(user = username, peer = %peer, "authentication failed");
+                        let error_info = ErrorInfo::new(
+                            "FATAL".to_string(),
+                            "28P01".to_string(),
+                            "password authentication failed".to_string(),
+                        );
+                        let error = ErrorResponse::from(error_info);
+                        client
+                            .feed(PgWireBackendMessage::ErrorResponse(error))
+                            .await?;
+                        client.close().await?;
+                    }
+                    AuthOutcome::LockedOut => {
+                        warn!(user = username, peer = %peer,
+                              "rejecting auth: peer is locked out after too many failures");
+                        let error_info = ErrorInfo::new(
+                            "FATAL".to_string(),
+                            "28000".to_string(),
+                            "too many failed authentication attempts; try again later".to_string(),
+                        );
+                        let error = ErrorResponse::from(error_info);
+                        client
+                            .feed(PgWireBackendMessage::ErrorResponse(error))
+                            .await?;
+                        client.close().await?;
+                    }
                 }
             }
 
@@ -396,16 +440,90 @@ struct DbQueryHandler {
     conn_id: u64,
     state: Arc<Mutex<ConnState>>,
     metrics: Metrics,
+    statement_timeout: Option<std::time::Duration>,
 }
 
 impl DbQueryHandler {
-    fn new(db: Database, conn_id: u64, metrics: Metrics) -> Self {
+    fn new(
+        db: Database,
+        conn_id: u64,
+        metrics: Metrics,
+        statement_timeout: Option<std::time::Duration>,
+    ) -> Self {
         Self {
             db,
             conn_id,
             state: Arc::new(Mutex::new(ConnState { active_txn: None })),
             metrics,
+            statement_timeout,
         }
+    }
+}
+
+/// Marker error returned when a statement runs past `--statement-timeout`.
+/// Recognized by the query handlers to translate into SQLSTATE 57014.
+#[derive(Debug)]
+struct StatementTimeout(std::time::Duration);
+
+impl std::fmt::Display for StatementTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "canceling statement due to statement timeout ({}s)",
+            self.0.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for StatementTimeout {}
+
+/// Run `db.execute_sql` on the blocking pool with an optional timeout. Returns
+/// the raw `SqlResult` plus the preprocessed SQL so callers can format the
+/// response synchronously. A timeout returns a `StatementTimeout` error which
+/// the caller maps to SQLSTATE 57014.
+async fn run_engine_query_with_timeout(
+    db: &Database,
+    sql: &str,
+    timeout: Option<std::time::Duration>,
+) -> (
+    String,
+    Result<SqlResult, Box<dyn std::error::Error + Send + Sync>>,
+) {
+    let preprocessed = preprocess_sql(sql);
+    let db_clone = db.clone();
+    let pre_clone = preprocessed.clone();
+    let work = tokio::task::spawn_blocking(move || db_clone.execute_sql(&pre_clone));
+    let outcome: Result<SqlResult, Box<dyn std::error::Error + Send + Sync>> = match timeout {
+        Some(t) => match tokio::time::timeout(t, work).await {
+            Ok(Ok(Ok(r))) => Ok(r),
+            Ok(Ok(Err(e))) => Err(Box::new(e)),
+            Ok(Err(join_err)) => Err(Box::new(join_err)),
+            Err(_) => Err(Box::new(StatementTimeout(t))),
+        },
+        None => match work.await {
+            Ok(Ok(r)) => Ok(r),
+            Ok(Err(e)) => Err(Box::new(e)),
+            Err(join_err) => Err(Box::new(join_err)),
+        },
+    };
+    (preprocessed, outcome)
+}
+
+/// Convert an engine error into a pgwire `UserError`. Preserves the
+/// `StatementTimeout` SQLSTATE 57014 specifically so clients can detect it.
+fn engine_err_to_pgwire(err: Box<dyn std::error::Error + Send + Sync>) -> PgWireError {
+    if err.is::<StatementTimeout>() {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_string(),
+            "57014".to_string(),
+            err.to_string(),
+        )))
+    } else {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_string(),
+            "42000".to_string(),
+            err.to_string(),
+        )))
     }
 }
 
@@ -433,16 +551,12 @@ impl SimpleQueryHandler for DbQueryHandler {
 
         for stmt in statements {
             self.metrics.record_query(QueryKind::from_sql(stmt));
-            match self.execute_one(stmt) {
+            match self.execute_one_async(stmt).await {
                 Ok(resp) => responses.push(resp),
-                Err(e) => {
+                Err(pg_err) => {
                     self.metrics.record_query_error();
-                    error!(conn_id = self.conn_id, error = %e, "query error");
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "42000".to_string(),
-                        e.to_string(),
-                    ))));
+                    error!(conn_id = self.conn_id, error = %pg_err, "query error");
+                    return Err(pg_err);
                 }
             }
         }
@@ -452,13 +566,21 @@ impl SimpleQueryHandler for DbQueryHandler {
 }
 
 impl DbQueryHandler {
-    fn execute_one<'a>(&self, sql: &str) -> Result<Response<'a>, Box<dyn std::error::Error>> {
+    async fn execute_one_async<'a>(&self, sql: &str) -> Result<Response<'a>, PgWireError> {
         let preprocessed = preprocess_sql(sql);
         if let Some(intercepted) = intercept_system_query(&preprocessed, &self.db) {
             return Ok(intercepted);
         }
-        let result = self.db.execute_sql(&preprocessed)?;
-        execute_sql_result(result, &self.state, &self.db)
+        let (_pre, outcome) =
+            run_engine_query_with_timeout(&self.db, sql, self.statement_timeout).await;
+        let result = outcome.map_err(engine_err_to_pgwire)?;
+        execute_sql_result(result, &self.state, &self.db).map_err(|e| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "42000".to_string(),
+                e.to_string(),
+            )))
+        })
     }
 }
 
@@ -1675,26 +1797,42 @@ struct DbExtendedQueryHandler {
     state: Arc<Mutex<ConnState>>,
     parser: Arc<DbQueryParser>,
     metrics: Metrics,
+    statement_timeout: Option<std::time::Duration>,
 }
 
 impl DbExtendedQueryHandler {
-    fn new(db: Database, conn_id: u64, state: Arc<Mutex<ConnState>>, metrics: Metrics) -> Self {
+    fn new(
+        db: Database,
+        conn_id: u64,
+        state: Arc<Mutex<ConnState>>,
+        metrics: Metrics,
+        statement_timeout: Option<std::time::Duration>,
+    ) -> Self {
         Self {
             db,
             conn_id,
             state,
             parser: Arc::new(DbQueryParser),
             metrics,
+            statement_timeout,
         }
     }
 
-    fn execute_one<'a>(&self, sql: &str) -> Result<Response<'a>, Box<dyn std::error::Error>> {
+    async fn execute_one_async<'a>(&self, sql: &str) -> Result<Response<'a>, PgWireError> {
         let preprocessed = preprocess_sql(sql);
         if let Some(intercepted) = intercept_system_query(&preprocessed, &self.db) {
             return Ok(intercepted);
         }
-        let result = self.db.execute_sql(&preprocessed)?;
-        execute_sql_result(result, &self.state, &self.db)
+        let (_pre, outcome) =
+            run_engine_query_with_timeout(&self.db, sql, self.statement_timeout).await;
+        let result = outcome.map_err(engine_err_to_pgwire)?;
+        execute_sql_result(result, &self.state, &self.db).map_err(|e| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "42000".to_string(),
+                e.to_string(),
+            )))
+        })
     }
 }
 
@@ -1902,16 +2040,12 @@ impl ExtendedQueryHandler for DbExtendedQueryHandler {
 
         self.metrics
             .record_query(QueryKind::from_sql(&resolved_sql));
-        match self.execute_one(&resolved_sql) {
+        match self.execute_one_async(&resolved_sql).await {
             Ok(resp) => Ok(resp),
-            Err(e) => {
+            Err(pg_err) => {
                 self.metrics.record_query_error();
-                error!(conn_id = self.conn_id, error = %e, "extended query error");
-                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "42000".to_string(),
-                    e.to_string(),
-                ))))
+                error!(conn_id = self.conn_id, error = %pg_err, "extended query error");
+                Err(pg_err)
             }
         }
     }
@@ -1962,6 +2096,7 @@ struct DbHandlerFactory {
     next_conn_id: Arc<AtomicU64>,
     auth: Option<Arc<Mutex<AuthManager>>>,
     metrics: Metrics,
+    statement_timeout: Option<std::time::Duration>,
 }
 
 impl PgWireHandlerFactory for DbHandlerFactory {
@@ -1983,6 +2118,7 @@ impl PgWireHandlerFactory for DbHandlerFactory {
             self.db.clone(),
             conn_id,
             self.metrics.clone(),
+            self.statement_timeout,
         ))
     }
 
@@ -1994,6 +2130,7 @@ impl PgWireHandlerFactory for DbHandlerFactory {
             conn_id,
             state,
             self.metrics.clone(),
+            self.statement_timeout,
         ))
     }
 
@@ -2065,6 +2202,10 @@ async fn main() {
 
     let metrics = Metrics::new();
 
+    // Coordinated shutdown: SIGINT or SIGTERM notifies all listeners.
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    spawn_shutdown_signal_listener(shutdown.clone());
+
     // Start web UI server.
     let web_state = web::AppState {
         db: db.clone(),
@@ -2078,6 +2219,7 @@ async fn main() {
         .parse()
         .expect("failed to parse web bind address");
 
+    let grace_period = std::time::Duration::from_secs(cfg.shutdown_grace);
     if let Some(tls) = &cfg.tls {
         rust_dst_db::tls::install_crypto_provider();
         let rustls_config = match axum_server::tls_rustls::RustlsConfig::from_pem_file(
@@ -2094,8 +2236,16 @@ async fn main() {
         };
         info!(addr = %web_addr_str, cert = %tls.web_cert_path,
               "web UI available over HTTPS; /metrics and /health exposed");
+        let web_handle = axum_server::Handle::new();
+        let web_handle_shutdown = web_handle.clone();
+        let shutdown_for_web = shutdown.clone();
+        tokio::spawn(async move {
+            shutdown_for_web.notified().await;
+            web_handle_shutdown.graceful_shutdown(Some(grace_period));
+        });
         tokio::spawn(async move {
             axum_server::bind_rustls(web_socket_addr, rustls_config)
+                .handle(web_handle)
                 .serve(web_router.into_make_service())
                 .await
                 .ok();
@@ -2105,8 +2255,12 @@ async fn main() {
             .await
             .expect("failed to bind web port");
         info!(addr = %web_addr_str, "web UI available; /metrics and /health exposed");
+        let shutdown_for_web = shutdown.clone();
         tokio::spawn(async move {
-            axum::serve(web_listener, web_router).await.ok();
+            axum::serve(web_listener, web_router)
+                .with_graceful_shutdown(async move { shutdown_for_web.notified().await })
+                .await
+                .ok();
         });
     }
 
@@ -2140,9 +2294,18 @@ async fn main() {
 
     let next_conn_id = Arc::new(AtomicU64::new(1));
     let max_connections = cfg.max_connections;
+    let shutdown_for_accept = shutdown.clone();
 
     loop {
-        match listener.accept().await {
+        let accept_result = tokio::select! {
+            biased;
+            _ = shutdown_for_accept.notified() => {
+                info!("shutdown signal received; stopping accept loop");
+                break;
+            }
+            res = listener.accept() => res,
+        };
+        match accept_result {
             Ok((socket, peer_addr)) => {
                 if max_connections > 0 && metrics.active_connections() >= max_connections {
                     metrics.connection_rejected();
@@ -2166,6 +2329,11 @@ async fn main() {
                     next_conn_id: Arc::clone(&next_conn_id),
                     auth: auth.clone(),
                     metrics: metrics.clone(),
+                    statement_timeout: if cfg.statement_timeout > 0 {
+                        Some(std::time::Duration::from_secs(cfg.statement_timeout))
+                    } else {
+                        None
+                    },
                 });
 
                 let metrics_for_spawn = metrics.clone();
@@ -2207,4 +2375,71 @@ async fn main() {
             }
         }
     }
+
+    drain_active_connections(&metrics, grace_period).await;
+
+    info!("flushing final checkpoint before exit");
+    if let Err(e) = db.checkpoint() {
+        error!(error = %e, "final checkpoint failed");
+    } else {
+        info!("checkpoint complete; goodbye");
+    }
+}
+
+/// Spawn a task that listens for SIGINT (ctrl-c) and SIGTERM and notifies the
+/// shared shutdown signal once. After firing once, the task exits.
+fn spawn_shutdown_signal_listener(shutdown: Arc<tokio::sync::Notify>) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigterm = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!(error = %e, "failed to install SIGTERM handler");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => info!("received SIGINT, beginning shutdown"),
+                _ = sigterm.recv() => info!("received SIGTERM, beginning shutdown"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("received SIGINT, beginning shutdown");
+        }
+        shutdown.notify_waiters();
+    });
+}
+
+/// Wait for active pgwire connections to drop to zero or for the grace period
+/// to elapse. Polls every 100ms — the per-connection cost of polling is
+/// negligible and we expect drains to take seconds at most.
+async fn drain_active_connections(metrics: &Metrics, grace: std::time::Duration) {
+    if grace.is_zero() {
+        info!(
+            active = metrics.active_connections(),
+            "shutdown grace = 0; exiting without drain"
+        );
+        return;
+    }
+    let deadline = std::time::Instant::now() + grace;
+    info!(
+        grace_secs = grace.as_secs(),
+        active = metrics.active_connections(),
+        "draining active pgwire connections"
+    );
+    while metrics.active_connections() > 0 {
+        if std::time::Instant::now() >= deadline {
+            warn!(
+                active = metrics.active_connections(),
+                "drain grace expired; forcing exit"
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    info!("all pgwire connections drained");
 }

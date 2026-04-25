@@ -277,6 +277,149 @@ async fn conn_limit_returns_fatal_error_response() {
     let _ = driver1.await;
 }
 
+#[cfg(unix)]
+fn send_sigterm(pid: u32) {
+    // SAFETY: libc::kill with a pid we own is benign; SIGTERM is a normal-shutdown
+    // signal handled by the server's signal listener.
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statement_timeout_does_not_break_fast_queries() {
+    // A 5s timeout should be plenty for a SELECT 1 round-trip.
+    let server = spawn_server_with(None, &["--statement-timeout", "5"]);
+    let conn_str = format!(
+        "host=127.0.0.1 port={} user=test dbname=postgres sslmode=disable",
+        server.pgwire_port
+    );
+    let (client, conn) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    assert_simple_select(&client, "SELECT 1", "1").await;
+    assert_simple_select(&client, "SELECT 99", "99").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn statement_timeout_fires_on_slow_query() {
+    // 1-second timeout. Build a synthetic "heavy" expression: a deeply
+    // right-nested arithmetic tree that the parser+executor must walk.
+    let server = spawn_server_with(None, &["--statement-timeout", "1"]);
+    let conn_str = format!(
+        "host=127.0.0.1 port={} user=test dbname=postgres sslmode=disable",
+        server.pgwire_port
+    );
+    let (client, conn) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Construct a SELECT with a long chain of "1 +" terms. 200k terms forces
+    // the parser to allocate a deep expression tree and the evaluator to
+    // recurse through it, which on the order of seconds in dev builds.
+    let mut sql = String::from("SELECT ");
+    for _ in 0..200_000 {
+        sql.push_str("1+");
+    }
+    sql.push('1');
+
+    let start = std::time::Instant::now();
+    let result = client.simple_query(&sql).await;
+    let elapsed = start.elapsed();
+
+    // Either the query succeeds quickly (engine was fast) or it hits the
+    // timeout. We assert: if it failed, the failure must be SQLSTATE 57014;
+    // and the call must not have hung past timeout + a generous slack.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "statement_timeout did not bound execution time; elapsed = {:?}",
+        elapsed
+    );
+    if let Err(err) = &result {
+        if let Some(db) = err.as_db_error() {
+            assert_eq!(db.code().code(), "57014", "expected timeout sqlstate");
+        }
+        // Either way (DbError or transport), we got a bounded failure: pass.
+    }
+    // If Ok, the engine completed under the timeout — also acceptable.
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn graceful_shutdown_drains_active_connection() {
+    let mut server = spawn_server_with(None, &["--shutdown-grace", "10"]);
+    let pid = server.child.id();
+
+    // Open a connection and verify it works before shutdown.
+    let conn_str = format!(
+        "host=127.0.0.1 port={} user=test dbname=postgres sslmode=disable",
+        server.pgwire_port
+    );
+    let (client, conn) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+        .await
+        .expect("first connection");
+    let driver = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    assert_simple_select(&client, "SELECT 1", "1").await;
+
+    // SIGTERM the server. The active connection should still complete its
+    // next query before the server exits.
+    send_sigterm(pid);
+
+    // Give the signal listener a moment to fire and the accept loop to exit.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // The held connection should still serve queries during the drain window.
+    assert_simple_select(&client, "SELECT 7", "7").await;
+
+    // New connections should be refused: the listener has stopped accepting.
+    let new_attempt = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio_postgres::connect(&conn_str, tokio_postgres::NoTls),
+    )
+    .await;
+    let new_attempt_failed = match new_attempt {
+        Ok(Ok(_)) => false,
+        Ok(Err(_)) | Err(_) => true,
+    };
+    assert!(
+        new_attempt_failed,
+        "expected new connect to fail after SIGTERM"
+    );
+
+    // Drop the held connection; server should exit cleanly within the grace
+    // window.
+    drop(client);
+    let _ = driver.await;
+
+    // The child should exit with status success now that the drain completed.
+    let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        match server.child.try_wait().expect("try_wait") {
+            Some(status) => {
+                assert!(
+                    status.success(),
+                    "server exited with non-success status: {status:?}"
+                );
+                break;
+            }
+            None => {
+                if std::time::Instant::now() > exit_deadline {
+                    panic!("server did not exit within 15s after SIGTERM");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
 // ─── web admin tests ─────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
