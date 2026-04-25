@@ -9,6 +9,8 @@ pub mod query;
 pub mod raft;
 pub mod sim;
 pub mod storage;
+#[cfg(feature = "server")]
+pub mod tls;
 pub mod traits;
 pub mod txn;
 pub mod wal;

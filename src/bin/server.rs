@@ -91,6 +91,23 @@ struct Args {
     /// WAL-bytes-written threshold for auto-checkpoint. 0 disables.
     #[arg(long)]
     checkpoint_wal_bytes: Option<u64>,
+
+    /// Path to PEM-encoded TLS certificate (server cert + chain).
+    #[arg(long)]
+    tls_cert: Option<String>,
+
+    /// Path to PEM-encoded TLS private key.
+    #[arg(long)]
+    tls_key: Option<String>,
+
+    /// pgwire TLS mode: "optional" (accept SSLRequest, allow plaintext) or
+    /// "required" (reject plaintext). Ignored if TLS is disabled.
+    #[arg(long)]
+    tls_mode: Option<String>,
+
+    /// Disable TLS even if the config file enables it.
+    #[arg(long)]
+    no_tls: bool,
 }
 
 /// TOML-deserialized config. Every field is optional so any subset can be set.
@@ -104,6 +121,24 @@ struct FileConfig {
     password: Option<String>,
     max_connections: Option<u64>,
     checkpoint_wal_bytes: Option<u64>,
+    tls: Option<FileTlsConfig>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct FileTlsConfig {
+    enabled: Option<bool>,
+    cert_path: Option<String>,
+    key_path: Option<String>,
+    /// "optional" (default) or "required" — pgwire only.
+    mode: Option<String>,
+    /// Optional per-listener override for the web admin port.
+    web: Option<FileTlsWebOverride>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct FileTlsWebOverride {
+    cert_path: Option<String>,
+    key_path: Option<String>,
 }
 
 /// Effective resolved server config: CLI > TOML > defaults.
@@ -117,6 +152,25 @@ struct ServerConfig {
     password: Option<String>,
     max_connections: u64,
     checkpoint_wal_bytes: u64,
+    tls: Option<ResolvedTls>,
+}
+
+/// pgwire TLS handshake mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TlsMode {
+    /// Server accepts SSLRequest if the client asks; plaintext is allowed.
+    Optional,
+    /// Server rejects plaintext: only TLS connections proceed.
+    Required,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedTls {
+    pgwire_cert_path: String,
+    pgwire_key_path: String,
+    web_cert_path: String,
+    web_key_path: String,
+    mode: TlsMode,
 }
 
 impl ServerConfig {
@@ -150,8 +204,137 @@ impl ServerConfig {
                 .checkpoint_wal_bytes
                 .or(file.checkpoint_wal_bytes)
                 .unwrap_or(rust_dst_db::engine::DEFAULT_CHECKPOINT_WAL_BYTES),
+            tls: resolve_tls(args, file.tls.as_ref())?,
         })
     }
+}
+
+fn resolve_tls(args: &Args, file: Option<&FileTlsConfig>) -> Result<Option<ResolvedTls>, String> {
+    if args.no_tls {
+        return Ok(None);
+    }
+
+    let file_enabled = file.and_then(|f| f.enabled).unwrap_or(false);
+    let cert = args
+        .tls_cert
+        .clone()
+        .or_else(|| file.and_then(|f| f.cert_path.clone()));
+    let key = args
+        .tls_key
+        .clone()
+        .or_else(|| file.and_then(|f| f.key_path.clone()));
+
+    // CLI cert+key activates TLS even if the file did not enable it.
+    let activate = file_enabled || (cert.is_some() && key.is_some());
+    if !activate {
+        return Ok(None);
+    }
+
+    let pgwire_cert_path =
+        cert.ok_or_else(|| "tls enabled but no certificate path configured".to_string())?;
+    let pgwire_key_path =
+        key.ok_or_else(|| "tls enabled but no private-key path configured".to_string())?;
+
+    let (web_cert_path, web_key_path) = match file.and_then(|f| f.web.as_ref()) {
+        Some(w) => (
+            w.cert_path
+                .clone()
+                .unwrap_or_else(|| pgwire_cert_path.clone()),
+            w.key_path
+                .clone()
+                .unwrap_or_else(|| pgwire_key_path.clone()),
+        ),
+        None => (pgwire_cert_path.clone(), pgwire_key_path.clone()),
+    };
+
+    let mode_str = args
+        .tls_mode
+        .clone()
+        .or_else(|| file.and_then(|f| f.mode.clone()))
+        .unwrap_or_else(|| "optional".into());
+    let mode = match mode_str.as_str() {
+        "optional" => TlsMode::Optional,
+        "required" => TlsMode::Required,
+        other => {
+            return Err(format!(
+                "invalid tls.mode '{}': use 'optional' or 'required'",
+                other
+            ));
+        }
+    };
+
+    Ok(Some(ResolvedTls {
+        pgwire_cert_path,
+        pgwire_key_path,
+        web_cert_path,
+        web_key_path,
+        mode,
+    }))
+}
+
+fn load_tls_acceptor(tls: &ResolvedTls) -> Result<Arc<tokio_rustls::TlsAcceptor>, String> {
+    rust_dst_db::tls::load_acceptor(&tls.pgwire_cert_path, &tls.pgwire_key_path)
+        .map_err(|e| e.to_string())
+}
+
+/// PostgreSQL SSLRequest startup packet: `length=8` then magic `80877103`.
+const PG_SSL_REQUEST: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x04, 0xD2, 0x16, 0x2F];
+
+/// First byte of a TLS 1.x ClientHello — used by pgwire's "direct SSL" flow.
+const TLS_CLIENT_HELLO_FIRST: u8 = 0x16;
+
+/// Peek the connection to determine whether the client is initiating TLS.
+/// Returns `true` for a TLS handshake or an SSLRequest, `false` otherwise.
+/// Used only when `tls.mode = "required"` — peeking does not consume bytes,
+/// so pgwire's own negotiator still sees the full stream.
+async fn peek_is_tls(socket: &tokio::net::TcpStream) -> std::io::Result<bool> {
+    let mut buf = [0u8; 8];
+    // peek may return fewer bytes than requested; loop until we have enough or EOF.
+    let mut have = 0usize;
+    while have < buf.len() {
+        let n = socket.peek(&mut buf[have..]).await?;
+        if n == 0 {
+            return Ok(false);
+        }
+        // peek returns the same prefix each call; if it didn't grow, we already saw the full pending data.
+        if n <= have {
+            break;
+        }
+        have = n;
+    }
+    if have == 0 {
+        return Ok(false);
+    }
+    if buf[0] == TLS_CLIENT_HELLO_FIRST {
+        return Ok(true);
+    }
+    Ok(have >= 8 && buf == PG_SSL_REQUEST)
+}
+
+/// Wire-format a PostgreSQL FATAL ErrorResponse and write it to the socket
+/// before closing. Used to reject plaintext connections when TLS is required.
+async fn send_tls_required_error(socket: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    // Build field bytes: 'S'FATAL\0 'C'08006\0 'M'msg\0 \0
+    let mut fields = Vec::<u8>::with_capacity(64);
+    fields.push(b'S');
+    fields.extend_from_slice(b"FATAL\0");
+    fields.push(b'C');
+    fields.extend_from_slice(b"08006\0");
+    fields.push(b'M');
+    fields.extend_from_slice(b"server requires TLS; connect with sslmode=require\0");
+    fields.push(0); // end of fields
+
+    // ErrorResponse: 'E' + length(4) + fields. Length includes itself.
+    let length = (fields.len() + 4) as u32;
+    let mut packet = Vec::with_capacity(1 + 4 + fields.len());
+    packet.push(b'E');
+    packet.extend_from_slice(&length.to_be_bytes());
+    packet.extend_from_slice(&fields);
+
+    socket.write_all(&packet).await?;
+    socket.shutdown().await
 }
 
 // ---------------------------------------------------------------------------
@@ -1921,21 +2104,69 @@ async fn main() {
         sessions: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         metrics: metrics.clone(),
     };
-    let web_addr = format!("{}:{}", cfg.bind, cfg.web_port);
+    let web_addr_str = format!("{}:{}", cfg.bind, cfg.web_port);
     let web_router = web::router(web_state);
-    let web_listener = tokio::net::TcpListener::bind(&web_addr)
-        .await
-        .expect("failed to bind web port");
-    info!(addr = %web_addr, "web UI available; /metrics and /health exposed");
+    let web_socket_addr: std::net::SocketAddr = web_addr_str
+        .parse()
+        .expect("failed to parse web bind address");
 
-    tokio::spawn(async move {
-        axum::serve(web_listener, web_router).await.ok();
-    });
+    if let Some(tls) = &cfg.tls {
+        rust_dst_db::tls::install_crypto_provider();
+        let rustls_config = match axum_server::tls_rustls::RustlsConfig::from_pem_file(
+            &tls.web_cert_path,
+            &tls.web_key_path,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                error!(error = %e, cert = %tls.web_cert_path, "failed to load web TLS material; aborting");
+                std::process::exit(1);
+            }
+        };
+        info!(addr = %web_addr_str, cert = %tls.web_cert_path,
+              "web UI available over HTTPS; /metrics and /health exposed");
+        tokio::spawn(async move {
+            axum_server::bind_rustls(web_socket_addr, rustls_config)
+                .serve(web_router.into_make_service())
+                .await
+                .ok();
+        });
+    } else {
+        let web_listener = tokio::net::TcpListener::bind(&web_addr_str)
+            .await
+            .expect("failed to bind web port");
+        info!(addr = %web_addr_str, "web UI available; /metrics and /health exposed");
+        tokio::spawn(async move {
+            axum::serve(web_listener, web_router).await.ok();
+        });
+    }
 
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");
 
+    let tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>> = if let Some(tls) = &cfg.tls {
+        rust_dst_db::tls::install_crypto_provider();
+        match load_tls_acceptor(tls) {
+            Ok(acc) => {
+                info!(
+                    cert = %tls.pgwire_cert_path,
+                    mode = ?tls.mode,
+                    "TLS enabled on pgwire port"
+                );
+                Some(acc)
+            }
+            Err(e) => {
+                error!(error = %e, "failed to initialize TLS; aborting startup");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
     info!(addr = %addr, max_connections = cfg.max_connections,
+          tls = tls_acceptor.is_some(),
           "listening for PostgreSQL connections");
     info!("connect with: psql -h 127.0.0.1 -p {}", cfg.port);
 
@@ -1965,8 +2196,29 @@ async fn main() {
                 });
 
                 let metrics_for_spawn = metrics.clone();
+                let tls_for_spawn = tls_acceptor.clone();
+                let tls_required =
+                    matches!(cfg.tls.as_ref().map(|t| t.mode), Some(TlsMode::Required));
                 tokio::spawn(async move {
-                    if let Err(e) = process_socket(socket, None, factory).await {
+                    let mut socket = socket;
+                    if tls_required {
+                        match peek_is_tls(&socket).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!(peer = %peer_addr,
+                                      "rejecting plaintext connection (tls.mode = required)");
+                                let _ = send_tls_required_error(&mut socket).await;
+                                metrics_for_spawn.connection_closed();
+                                return;
+                            }
+                            Err(e) => {
+                                warn!(peer = %peer_addr, error = %e, "tls peek failed");
+                                metrics_for_spawn.connection_closed();
+                                return;
+                            }
+                        }
+                    }
+                    if let Err(e) = process_socket(socket, tls_for_spawn, factory).await {
                         warn!(peer = %peer_addr, error = %e, "connection error");
                     }
                     metrics_for_spawn.connection_closed();

@@ -146,9 +146,10 @@ impl StateMachine for BufferPool {
 
                 // Evict if at capacity and this is a new page.
                 if !self.cache.contains_key(&page_id)
-                    && let Some(write_msg) = self.evict_one() {
-                        outgoing.push(write_msg);
-                    }
+                    && let Some(write_msg) = self.evict_one()
+                {
+                    outgoing.push(write_msg);
+                }
 
                 // Insert or update the page.
                 if let Some(entry) = self.cache.get_mut(&page_id) {
@@ -229,9 +230,10 @@ impl StateMachine for BufferPool {
                 // Evict if needed.
                 let mut outgoing = Vec::new();
                 if !self.cache.contains_key(&page_id)
-                    && let Some(write_msg) = self.evict_one() {
-                        outgoing.push(write_msg);
-                    }
+                    && let Some(write_msg) = self.evict_one()
+                {
+                    outgoing.push(write_msg);
+                }
 
                 // Cache the page.
                 let entry = PageEntry::new(data.clone(), self.now);

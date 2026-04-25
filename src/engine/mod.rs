@@ -332,13 +332,15 @@ impl Database {
         }
         for (k, v) in &txn.write_set {
             if let Some(s) = start
-                && k.as_slice() < s {
-                    continue;
-                }
+                && k.as_slice() < s
+            {
+                continue;
+            }
             if let Some(e) = end
-                && k.as_slice() >= e {
-                    continue;
-                }
+                && k.as_slice() >= e
+            {
+                continue;
+            }
             merged.insert(k.clone(), v.clone());
         }
         entries = merged
@@ -756,9 +758,10 @@ impl Database {
             table_key.push(0x00);
             table_key.extend_from_slice(pk_encoded);
             if let Some(data) = inner.store.read(&table_key, snapshot_ts)
-                && let Some(row) = schema.decode_row(&data) {
-                    rows.push(row);
-                }
+                && let Some(row) = schema.decode_row(&data)
+            {
+                rows.push(row);
+            }
         }
         Ok(rows)
     }
@@ -852,7 +855,9 @@ impl Database {
 
                     // Check for existing row (for ON CONFLICT handling)
                     let existing = self.get(txn_id, &key)?;
-                    if let (Some(existing_data), Some(sqlparser::ast::OnInsert::OnConflict(oc))) = (existing, on_conflict) {
+                    if let (Some(existing_data), Some(sqlparser::ast::OnInsert::OnConflict(oc))) =
+                        (existing, on_conflict)
+                    {
                         match &oc.action {
                             sqlparser::ast::OnConflictAction::DoNothing => {
                                 continue;
@@ -866,13 +871,11 @@ impl Database {
                                         sqlparser::ast::AssignmentTarget::ColumnName(name) => {
                                             name.to_string()
                                         }
-                                        sqlparser::ast::AssignmentTarget::Tuple(names) => names
-                                            .first()
-                                            .map(|n| n.to_string())
-                                            .unwrap_or_default(),
+                                        sqlparser::ast::AssignmentTarget::Tuple(names) => {
+                                            names.first().map(|n| n.to_string()).unwrap_or_default()
+                                        }
                                     };
-                                    let value =
-                                        resolve_excluded_value(&assignment.value, &row)?;
+                                    let value = resolve_excluded_value(&assignment.value, &row)?;
                                     let coerced =
                                         coerce_value_for_column(value, &col_name, &schema)?;
                                     merged.insert(col_name, coerced);
@@ -976,9 +979,10 @@ impl Database {
                 let mut count = 0u64;
                 for row in &rows {
                     if let Some(ref plan) = predicate
-                        && execute(plan, vec![row.clone()]).is_empty() {
-                            continue;
-                        }
+                        && execute(plan, vec![row.clone()]).is_empty()
+                    {
+                        continue;
+                    }
                     let mut updated_row = row.clone();
                     for assignment in assignments {
                         let col_name = match &assignment.target {
@@ -1080,9 +1084,10 @@ impl Database {
                 let mut count = 0u64;
                 for row in &rows {
                     if let Some(ref plan) = predicate
-                        && execute(plan, vec![row.clone()]).is_empty() {
-                            continue;
-                        }
+                        && execute(plan, vec![row.clone()]).is_empty()
+                    {
+                        continue;
+                    }
                     if has_returning {
                         returned_rows.push(project_returning(row, &returning_cols, &schema));
                     }

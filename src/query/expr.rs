@@ -1075,10 +1075,12 @@ fn like_match_inner(v: &[char], p: &[char], escape: Option<char>) -> bool {
         return v.is_empty();
     }
     if let Some(e) = escape
-        && p[0] == e && p.len() >= 2 {
-            // Literal match of the escaped character.
-            return !v.is_empty() && v[0] == p[1] && like_match_inner(&v[1..], &p[2..], escape);
-        }
+        && p[0] == e
+        && p.len() >= 2
+    {
+        // Literal match of the escaped character.
+        return !v.is_empty() && v[0] == p[1] && like_match_inner(&v[1..], &p[2..], escape);
+    }
     match p[0] {
         '%' => {
             let mut pi = 0;

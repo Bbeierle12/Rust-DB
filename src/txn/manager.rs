@@ -354,13 +354,15 @@ impl StateMachine for TransactionManager {
                     for (k, v) in &txn.write_set {
                         // Check range bounds.
                         if let Some(ref s) = start
-                            && k.as_slice() < s.as_slice() {
-                                continue;
-                            }
+                            && k.as_slice() < s.as_slice()
+                        {
+                            continue;
+                        }
                         if let Some(ref e) = end
-                            && k.as_slice() >= e.as_slice() {
-                                continue;
-                            }
+                            && k.as_slice() >= e.as_slice()
+                        {
+                            continue;
+                        }
                         merged.insert(k.clone(), v.clone());
                     }
 

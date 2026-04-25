@@ -51,9 +51,10 @@ impl MvccStore {
     /// Used for write-write conflict detection in OCC.
     pub fn has_write_after(&self, key: &[u8], after_ts: u64) -> bool {
         if let Some(chain) = self.versions.get(key)
-            && let Some(latest) = chain.first() {
-                return latest.commit_ts > after_ts;
-            }
+            && let Some(latest) = chain.first()
+        {
+            return latest.commit_ts > after_ts;
+        }
         false
     }
 
@@ -87,9 +88,10 @@ impl MvccStore {
         for (key, chain) in iter {
             // Check end bound.
             if let Some(e) = end
-                && key.as_slice() >= e {
-                    break;
-                }
+                && key.as_slice() >= e
+            {
+                break;
+            }
 
             // Find the visible version at snapshot_ts.
             for version in chain {

@@ -129,15 +129,13 @@ fn verify_password(username: &str, password: &str, stored: &str) -> bool {
 }
 
 /// Authentication configuration.
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct AuthConfig {
     /// Whether authentication is enabled.
     pub enabled: bool,
     /// List of (username, password) pairs.
     pub users: Vec<(String, String)>,
 }
-
 
 #[cfg(test)]
 mod tests {

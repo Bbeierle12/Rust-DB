@@ -172,13 +172,15 @@ impl BTreeEngine {
             .into_iter()
             .filter(|(k, _)| {
                 if let Some(s) = start
-                    && k.as_slice() < s {
-                        return false;
-                    }
+                    && k.as_slice() < s
+                {
+                    return false;
+                }
                 if let Some(e) = end
-                    && k.as_slice() >= e {
-                        return false;
-                    }
+                    && k.as_slice() >= e
+                {
+                    return false;
+                }
                 true
             })
             .collect()
@@ -334,9 +336,10 @@ impl BTreeEngine {
     fn find_parent(&self, child_id: PageId) -> Option<PageId> {
         for (pid, node) in &self.nodes {
             if let BTreeNode::Internal { children, .. } = node
-                && children.contains(&child_id) {
-                    return Some(*pid);
-                }
+                && children.contains(&child_id)
+            {
+                return Some(*pid);
+            }
         }
         None
     }

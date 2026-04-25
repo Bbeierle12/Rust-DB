@@ -15,7 +15,7 @@ required-features = ["server"]
 [features]
 pgwire = ["dep:pgwire", "dep:tokio", "dep:async-trait", "dep:futures"]
 python = ["dep:pyo3"]
-server = ["pgwire", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:axum", "dep:serde", "dep:serde_json", "dep:tower-http", "dep:uuid", "dep:toml"]
+server = ["pgwire", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:axum", "dep:serde", "dep:serde_json", "dep:tower-http", "dep:uuid", "dep:toml", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:axum-server"]
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
@@ -37,9 +37,15 @@ serde_json         = { version = "1",   optional = true }
 tower-http         = { version = "0.6", features = ["cors"], optional = true }
 uuid               = { version = "1",   features = ["v4"], optional = true }
 toml               = { version = "0.8", optional = true }
+tokio-rustls       = { version = "0.26", default-features = false, features = ["logging", "tls12", "aws-lc-rs"], optional = true }
+rustls-pemfile     = { version = "2",   optional = true }
+axum-server        = { version = "0.7", features = ["tls-rustls"], optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+rcgen = "0.13"
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.13"
 
 [patch.crates-io]
 pgwire = { path = "vendor/pgwire" }
