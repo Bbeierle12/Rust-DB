@@ -67,6 +67,10 @@ impl Drop for SpawnedServer {
 }
 
 fn spawn_server(tls_mode: Option<&str>) -> SpawnedServer {
+    spawn_server_with(tls_mode, &[])
+}
+
+fn spawn_server_with(tls_mode: Option<&str>, extra_args: &[&str]) -> SpawnedServer {
     let (cert_pem, key_pem, cert_der) = make_self_signed();
     let cert_path = write_temp("cert", &cert_pem);
     let key_path = write_temp("key", &key_pem);
@@ -97,6 +101,9 @@ fn spawn_server(tls_mode: Option<&str>) -> SpawnedServer {
     if let Some(m) = tls_mode {
         cmd.arg("--tls-mode").arg(m);
     }
+    for a in extra_args {
+        cmd.arg(a);
+    }
     let child = cmd.spawn().expect("spawn rust-db-server");
 
     // Wait for both ports to accept TCP connections.
@@ -115,6 +122,11 @@ fn spawn_server(tls_mode: Option<&str>) -> SpawnedServer {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    // The readiness probe above opened a transient TCP connection that the
+    // server counts as active until its accept-loop spawn task notices the
+    // peer closed. Give it a beat to settle so tests like the conn-limit
+    // assertion see a clean active_connections=0.
+    std::thread::sleep(Duration::from_millis(250));
 
     SpawnedServer {
         child,
@@ -222,6 +234,47 @@ async fn pgwire_required_mode_accepts_tls() {
     });
 
     assert_simple_select(&client, "SELECT 42", "42").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn conn_limit_returns_fatal_error_response() {
+    let server = spawn_server_with(None, &["--max-connections", "1"]);
+
+    // First connection holds the slot.
+    let conn_str = format!(
+        "host=127.0.0.1 port={} user=test dbname=postgres sslmode=disable",
+        server.pgwire_port
+    );
+    let (client1, conn1) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+        .await
+        .expect("first connection");
+    let driver1 = tokio::spawn(async move {
+        let _ = conn1.await;
+    });
+    // Sanity: the first connection works.
+    let _ = client1
+        .simple_query("SELECT 1")
+        .await
+        .expect("first conn query");
+
+    // Second connection should be rejected with FATAL/53300 before any backend message.
+    let result = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await;
+    let err = match result {
+        Ok(_) => panic!("expected second connection to be rejected"),
+        Err(e) => e,
+    };
+    let db_err = err
+        .as_db_error()
+        .unwrap_or_else(|| panic!("expected DbError, got: {err} (debug: {err:?})"));
+    assert_eq!(db_err.code().code(), "53300", "wrong sqlstate");
+    assert!(
+        db_err.message().to_lowercase().contains("connection"),
+        "expected connection-related message, got: {}",
+        db_err.message()
+    );
+
+    drop(client1);
+    let _ = driver1.await;
 }
 
 // ─── web admin tests ─────────────────────────────────────────────────────────

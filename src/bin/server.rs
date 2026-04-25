@@ -277,56 +277,27 @@ fn load_tls_acceptor(tls: &ResolvedTls) -> Result<Arc<tokio_rustls::TlsAcceptor>
         .map_err(|e| e.to_string())
 }
 
-/// PostgreSQL SSLRequest startup packet: `length=8` then magic `80877103`.
-const PG_SSL_REQUEST: [u8; 8] = [0x00, 0x00, 0x00, 0x08, 0x04, 0xD2, 0x16, 0x2F];
-
-/// First byte of a TLS 1.x ClientHello — used by pgwire's "direct SSL" flow.
-const TLS_CLIENT_HELLO_FIRST: u8 = 0x16;
-
-/// Peek the connection to determine whether the client is initiating TLS.
-/// Returns `true` for a TLS handshake or an SSLRequest, `false` otherwise.
-/// Used only when `tls.mode = "required"` — peeking does not consume bytes,
-/// so pgwire's own negotiator still sees the full stream.
-async fn peek_is_tls(socket: &tokio::net::TcpStream) -> std::io::Result<bool> {
-    let mut buf = [0u8; 8];
-    // peek may return fewer bytes than requested; loop until we have enough or EOF.
-    let mut have = 0usize;
-    while have < buf.len() {
-        let n = socket.peek(&mut buf[have..]).await?;
-        if n == 0 {
-            return Ok(false);
-        }
-        // peek returns the same prefix each call; if it didn't grow, we already saw the full pending data.
-        if n <= have {
-            break;
-        }
-        have = n;
-    }
-    if have == 0 {
-        return Ok(false);
-    }
-    if buf[0] == TLS_CLIENT_HELLO_FIRST {
-        return Ok(true);
-    }
-    Ok(have >= 8 && buf == PG_SSL_REQUEST)
-}
-
 /// Wire-format a PostgreSQL FATAL ErrorResponse and write it to the socket
-/// before closing. Used to reject plaintext connections when TLS is required.
-async fn send_tls_required_error(socket: &mut tokio::net::TcpStream) -> std::io::Result<()> {
+/// before closing. Used to reject connections that the server can't or
+/// won't service (TLS required, connection limit reached, etc).
+async fn send_pg_fatal(
+    socket: &mut tokio::net::TcpStream,
+    sqlstate: &str,
+    message: &str,
+) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    // Build field bytes: 'S'FATAL\0 'C'08006\0 'M'msg\0 \0
     let mut fields = Vec::<u8>::with_capacity(64);
     fields.push(b'S');
     fields.extend_from_slice(b"FATAL\0");
     fields.push(b'C');
-    fields.extend_from_slice(b"08006\0");
+    fields.extend_from_slice(sqlstate.as_bytes());
+    fields.push(0);
     fields.push(b'M');
-    fields.extend_from_slice(b"server requires TLS; connect with sslmode=require\0");
+    fields.extend_from_slice(message.as_bytes());
+    fields.push(0);
     fields.push(0); // end of fields
 
-    // ErrorResponse: 'E' + length(4) + fields. Length includes itself.
     let length = (fields.len() + 4) as u32;
     let mut packet = Vec::with_capacity(1 + 4 + fields.len());
     packet.push(b'E');
@@ -1142,7 +1113,7 @@ fn evaluate_scalar_select<'a>(norm: &str) -> Response<'a> {
 /// Return only the column schema for an intercepted system query — no rows.
 /// Must be exactly consistent with what `intercept_system_query` produces.
 /// Returns `Some(fields)` (possibly empty) when intercepted, `None` otherwise.
-fn field_info_for_intercept(sql: &str, db: &Database) -> Option<Vec<FieldInfo>> {
+fn field_info_for_intercept(sql: &str) -> Option<Vec<FieldInfo>> {
     let norm = sql.trim().to_lowercase();
 
     // Control commands → no result columns.
@@ -1356,13 +1327,10 @@ fn field_info_for_intercept(sql: &str, db: &Database) -> Option<Vec<FieldInfo>> 
     let has_from = norm.split_whitespace().any(|t| t == "from");
     if norm.starts_with("select ") && !has_from {
         let rest = norm["select ".len()..].trim().to_string();
-        let (expr_raw, alias) = if let Some(pos) = rest.find(" as ") {
-            (
-                rest[..pos].trim().to_string(),
-                rest[pos + 4..].trim().to_string(),
-            )
+        let alias = if let Some(pos) = rest.find(" as ") {
+            rest[pos + 4..].trim().to_string()
         } else {
-            (rest.trim().to_string(), "?column?".to_string())
+            "?column?".to_string()
         };
         // All TEXT — avoids binary-format decoding issues with asyncpg.
         return Some(vec![FieldInfo::new(
@@ -1408,7 +1376,7 @@ fn describe_sql_columns(sql: &str, db: &Database) -> Vec<FieldInfo> {
 
     // Check intercept layer first — before the SQL parser, so system catalog
     // queries that sqlparser can't parse still get the right column schema.
-    if let Some(fields) = field_info_for_intercept(&sanitized, db) {
+    if let Some(fields) = field_info_for_intercept(&sanitized) {
         return fields;
     }
 
@@ -2180,8 +2148,13 @@ async fn main() {
                     metrics.connection_rejected();
                     warn!(peer = %peer_addr, limit = max_connections,
                           "rejecting connection: limit reached");
-                    // Best-effort close; clients get ECONNRESET.
-                    drop(socket);
+                    let mut socket = socket;
+                    let _ = send_pg_fatal(
+                        &mut socket,
+                        "53300",
+                        "server has reached the configured connection limit",
+                    )
+                    .await;
                     continue;
                 }
 
@@ -2202,12 +2175,17 @@ async fn main() {
                 tokio::spawn(async move {
                     let mut socket = socket;
                     if tls_required {
-                        match peek_is_tls(&socket).await {
+                        match rust_dst_db::tls::peek_is_tls(&socket).await {
                             Ok(true) => {}
                             Ok(false) => {
                                 warn!(peer = %peer_addr,
                                       "rejecting plaintext connection (tls.mode = required)");
-                                let _ = send_tls_required_error(&mut socket).await;
+                                let _ = send_pg_fatal(
+                                    &mut socket,
+                                    "08006",
+                                    "server requires TLS; connect with sslmode=require",
+                                )
+                                .await;
                                 metrics_for_spawn.connection_closed();
                                 return;
                             }
