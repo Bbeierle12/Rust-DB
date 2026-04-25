@@ -143,6 +143,10 @@ struct FileTlsConfig {
     key_path: Option<String>,
     /// "optional" (default) or "required" — pgwire only.
     mode: Option<String>,
+    /// Client certificate authentication: "none" (default), "optional", or
+    /// "required". `client_ca_path` is required for the latter two.
+    client_auth: Option<String>,
+    client_ca_path: Option<String>,
     /// Optional per-listener override for the web admin port.
     web: Option<FileTlsWebOverride>,
 }
@@ -185,6 +189,7 @@ struct ResolvedTls {
     web_cert_path: String,
     web_key_path: String,
     mode: TlsMode,
+    client_auth: rust_dst_db::tls::ClientAuth,
 }
 
 impl ServerConfig {
@@ -282,18 +287,49 @@ fn resolve_tls(args: &Args, file: Option<&FileTlsConfig>) -> Result<Option<Resol
         }
     };
 
+    let client_auth_str = file
+        .and_then(|f| f.client_auth.clone())
+        .unwrap_or_else(|| "none".into());
+    let client_ca_path = file.and_then(|f| f.client_ca_path.clone());
+    let client_auth = match client_auth_str.as_str() {
+        "none" => rust_dst_db::tls::ClientAuth::None,
+        "optional" => match client_ca_path {
+            Some(p) => rust_dst_db::tls::ClientAuth::Optional {
+                ca_path: std::path::PathBuf::from(p),
+            },
+            None => return Err("tls.client_auth = 'optional' requires tls.client_ca_path".into()),
+        },
+        "required" => match client_ca_path {
+            Some(p) => rust_dst_db::tls::ClientAuth::Required {
+                ca_path: std::path::PathBuf::from(p),
+            },
+            None => return Err("tls.client_auth = 'required' requires tls.client_ca_path".into()),
+        },
+        other => {
+            return Err(format!(
+                "invalid tls.client_auth '{}': use 'none', 'optional', or 'required'",
+                other
+            ));
+        }
+    };
+
     Ok(Some(ResolvedTls {
         pgwire_cert_path,
         pgwire_key_path,
         web_cert_path,
         web_key_path,
         mode,
+        client_auth,
     }))
 }
 
 fn load_tls_acceptor(tls: &ResolvedTls) -> Result<Arc<tokio_rustls::TlsAcceptor>, String> {
-    rust_dst_db::tls::load_acceptor(&tls.pgwire_cert_path, &tls.pgwire_key_path)
-        .map_err(|e| e.to_string())
+    rust_dst_db::tls::load_acceptor_with_client_auth(
+        &tls.pgwire_cert_path,
+        &tls.pgwire_key_path,
+        &tls.client_auth,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Wire-format a PostgreSQL FATAL ErrorResponse and write it to the socket
@@ -2220,6 +2256,7 @@ async fn main() {
         .expect("failed to parse web bind address");
 
     let grace_period = std::time::Duration::from_secs(cfg.shutdown_grace);
+    let mut web_rustls_config_for_reload: Option<axum_server::tls_rustls::RustlsConfig> = None;
     if let Some(tls) = &cfg.tls {
         rust_dst_db::tls::install_crypto_provider();
         let rustls_config = match axum_server::tls_rustls::RustlsConfig::from_pem_file(
@@ -2234,6 +2271,7 @@ async fn main() {
                 std::process::exit(1);
             }
         };
+        web_rustls_config_for_reload = Some(rustls_config.clone());
         info!(addr = %web_addr_str, cert = %tls.web_cert_path,
               "web UI available over HTTPS; /metrics and /health exposed");
         let web_handle = axum_server::Handle::new();
@@ -2267,28 +2305,37 @@ async fn main() {
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     let listener = TcpListener::bind(&addr).await.expect("failed to bind");
 
-    let tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>> = if let Some(tls) = &cfg.tls {
-        rust_dst_db::tls::install_crypto_provider();
-        match load_tls_acceptor(tls) {
-            Ok(acc) => {
-                info!(
-                    cert = %tls.pgwire_cert_path,
-                    mode = ?tls.mode,
-                    "TLS enabled on pgwire port"
-                );
-                Some(acc)
+    let tls_acceptor_swap: Option<Arc<arc_swap::ArcSwap<tokio_rustls::TlsAcceptor>>> =
+        if let Some(tls) = &cfg.tls {
+            rust_dst_db::tls::install_crypto_provider();
+            match load_tls_acceptor(tls) {
+                Ok(acc) => {
+                    info!(
+                        cert = %tls.pgwire_cert_path,
+                        mode = ?tls.mode,
+                        "TLS enabled on pgwire port"
+                    );
+                    Some(Arc::new(arc_swap::ArcSwap::from(acc)))
+                }
+                Err(e) => {
+                    error!(error = %e, "failed to initialize TLS; aborting startup");
+                    std::process::exit(1);
+                }
             }
-            Err(e) => {
-                error!(error = %e, "failed to initialize TLS; aborting startup");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
+
+    // SIGHUP cert reload. Re-reads the same on-disk paths and atomically
+    // swaps the live acceptor. Existing connections keep their old TLS
+    // session; new connections see the new cert.
+    if let (Some(tls_cfg), Some(acceptor_swap)) = (cfg.tls.clone(), tls_acceptor_swap.clone()) {
+        let web_reload = web_rustls_config_for_reload.clone();
+        spawn_sighup_reload_listener(tls_cfg, acceptor_swap, web_reload);
+    }
 
     info!(addr = %addr, max_connections = cfg.max_connections,
-          tls = tls_acceptor.is_some(),
+          tls = tls_acceptor_swap.is_some(),
           "listening for PostgreSQL connections");
     info!("connect with: psql -h 127.0.0.1 -p {}", cfg.port);
 
@@ -2337,7 +2384,11 @@ async fn main() {
                 });
 
                 let metrics_for_spawn = metrics.clone();
-                let tls_for_spawn = tls_acceptor.clone();
+                // Snapshot the current acceptor at accept time. SIGHUP may
+                // have swapped it since the listener was started.
+                let tls_for_spawn: Option<Arc<tokio_rustls::TlsAcceptor>> = tls_acceptor_swap
+                    .as_ref()
+                    .map(|swap| arc_swap::ArcSwap::load_full(swap.as_ref()));
                 let tls_required =
                     matches!(cfg.tls.as_ref().map(|t| t.mode), Some(TlsMode::Required));
                 tokio::spawn(async move {
@@ -2384,6 +2435,69 @@ async fn main() {
     } else {
         info!("checkpoint complete; goodbye");
     }
+}
+
+/// Spawn a task that listens for SIGHUP and reloads TLS material in place.
+/// The pgwire acceptor is swapped via `ArcSwap`; the web admin's
+/// `RustlsConfig` is reloaded via its built-in `reload_from_pem_file`.
+/// Reload failures log a warning and leave the previous material in place.
+#[cfg(unix)]
+fn spawn_sighup_reload_listener(
+    tls_cfg: ResolvedTls,
+    pgwire_acceptor: Arc<arc_swap::ArcSwap<tokio_rustls::TlsAcceptor>>,
+    web_rustls_config: Option<axum_server::tls_rustls::RustlsConfig>,
+) {
+    tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => s,
+            Err(e) => {
+                error!(error = %e, "failed to install SIGHUP handler");
+                return;
+            }
+        };
+        loop {
+            sighup.recv().await;
+            info!(
+                cert = %tls_cfg.pgwire_cert_path,
+                "SIGHUP received; reloading TLS material"
+            );
+
+            match rust_dst_db::tls::load_acceptor_with_client_auth(
+                &tls_cfg.pgwire_cert_path,
+                &tls_cfg.pgwire_key_path,
+                &tls_cfg.client_auth,
+            ) {
+                Ok(new_acc) => {
+                    pgwire_acceptor.store(new_acc);
+                    info!("pgwire TLS material reloaded");
+                }
+                Err(e) => {
+                    warn!(error = %e, "pgwire TLS reload failed; previous material retained");
+                }
+            }
+
+            if let Some(cfg) = &web_rustls_config {
+                match cfg
+                    .reload_from_pem_file(&tls_cfg.web_cert_path, &tls_cfg.web_key_path)
+                    .await
+                {
+                    Ok(()) => info!("web admin TLS material reloaded"),
+                    Err(e) => {
+                        warn!(error = %e, "web TLS reload failed; previous material retained")
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_sighup_reload_listener(
+    _: ResolvedTls,
+    _: Arc<arc_swap::ArcSwap<tokio_rustls::TlsAcceptor>>,
+    _: Option<axum_server::tls_rustls::RustlsConfig>,
+) {
 }
 
 /// Spawn a task that listens for SIGINT (ctrl-c) and SIGTERM and notifies the

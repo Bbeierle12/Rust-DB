@@ -70,6 +70,166 @@ fn spawn_server(tls_mode: Option<&str>) -> SpawnedServer {
     spawn_server_with(tls_mode, &[])
 }
 
+/// Materials for a CA + server cert + client cert chain.
+struct CaBundle {
+    /// CA cert in PEM (used as `tls.client_ca_path` and as the trusted root
+    /// for the rustls client during the handshake).
+    ca_pem: String,
+    server_cert_pem: String,
+    server_key_pem: String,
+    client_cert_pem: String,
+    client_key_pem: String,
+}
+
+fn make_ca_bundle() -> CaBundle {
+    let ca_key = rcgen::KeyPair::generate().expect("ca key");
+    let mut ca_params =
+        rcgen::CertificateParams::new(vec!["rustdb-test-ca".to_string()]).expect("ca params");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).expect("ca self-sign");
+
+    let server_key = rcgen::KeyPair::generate().expect("server key");
+    let server_params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("server params");
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .expect("server signed");
+
+    let client_key = rcgen::KeyPair::generate().expect("client key");
+    let client_params = rcgen::CertificateParams::new(vec!["rustdb-test-client".to_string()])
+        .expect("client params");
+    let client_cert = client_params
+        .signed_by(&client_key, &ca_cert, &ca_key)
+        .expect("client signed");
+
+    CaBundle {
+        ca_pem: ca_cert.pem(),
+        server_cert_pem: server_cert.pem(),
+        server_key_pem: server_key.serialize_pem(),
+        client_cert_pem: client_cert.pem(),
+        client_key_pem: client_key.serialize_pem(),
+    }
+}
+
+/// Spawn a server with mTLS configured via a generated TOML file.
+struct MtlsServer {
+    server: SpawnedServer,
+    bundle: CaBundle,
+    _config_path: PathBuf,
+}
+
+fn spawn_server_mtls(client_auth: &str) -> MtlsServer {
+    let bundle = make_ca_bundle();
+    let server_cert_path = write_temp("srv-cert", &bundle.server_cert_pem);
+    let server_key_path = write_temp("srv-key", &bundle.server_key_pem);
+    let ca_path = write_temp("ca", &bundle.ca_pem);
+
+    let pgwire_port = pick_free_port();
+    let web_port = pick_free_port();
+    let data_dir = std::env::temp_dir().join(format!(
+        "rustdb-mtls-it-data-{}-{}",
+        std::process::id(),
+        rand::random::<u64>(),
+    ));
+    std::fs::create_dir_all(&data_dir).expect("data dir");
+
+    let toml = format!(
+        r#"
+data_dir = "{}"
+port = {}
+web_port = {}
+
+[tls]
+enabled = true
+cert_path = "{}"
+key_path  = "{}"
+mode      = "optional"
+client_auth = "{}"
+client_ca_path = "{}"
+"#,
+        data_dir.display(),
+        pgwire_port,
+        web_port,
+        server_cert_path.display(),
+        server_key_path.display(),
+        client_auth,
+        ca_path.display(),
+    );
+    let config_path = std::env::temp_dir().join(format!(
+        "rustdb-mtls-cfg-{}-{}.toml",
+        std::process::id(),
+        rand::random::<u64>(),
+    ));
+    std::fs::write(&config_path, toml).expect("write config");
+
+    let bin = env!("CARGO_BIN_EXE_rust-db-server");
+    let child = Command::new(bin)
+        .arg("--config")
+        .arg(&config_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn rust-db-server");
+
+    // Readiness probe.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if std::net::TcpStream::connect(("127.0.0.1", pgwire_port)).is_ok() {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("mTLS server did not start within 15s");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(250));
+
+    MtlsServer {
+        server: SpawnedServer {
+            child,
+            pgwire_port,
+            web_port,
+            cert_der: vec![], // not used for mTLS path
+            cert_path: server_cert_path,
+            key_path: server_key_path,
+            data_dir,
+        },
+        bundle,
+        _config_path: config_path,
+    }
+}
+
+fn mtls_client_config(bundle: &CaBundle, with_client_cert: bool) -> Arc<ClientConfig> {
+    rust_dst_db::tls::install_crypto_provider();
+
+    // Trust the test CA.
+    let ca_certs: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut bundle.ca_pem.as_bytes())
+            .collect::<Result<_, _>>()
+            .expect("parse ca pem");
+    let mut roots = RootCertStore::empty();
+    for c in ca_certs {
+        roots.add(c).expect("trust ca");
+    }
+    let builder = ClientConfig::builder().with_root_certificates(roots);
+
+    let cfg = if with_client_cert {
+        let client_certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut bundle.client_cert_pem.as_bytes())
+                .collect::<Result<_, _>>()
+                .expect("parse client cert");
+        let client_key = rustls_pemfile::private_key(&mut bundle.client_key_pem.as_bytes())
+            .expect("parse client key")
+            .expect("client key present");
+        builder
+            .with_client_auth_cert(client_certs, client_key)
+            .expect("client auth cert")
+    } else {
+        builder.with_no_client_auth()
+    };
+    Arc::new(cfg)
+}
+
 fn spawn_server_with(tls_mode: Option<&str>, extra_args: &[&str]) -> SpawnedServer {
     let (cert_pem, key_pem, cert_der) = make_self_signed();
     let cert_path = write_temp("cert", &cert_pem);
@@ -374,7 +534,8 @@ async fn graceful_shutdown_drains_active_connection() {
     send_sigterm(pid);
 
     // Give the signal listener a moment to fire and the accept loop to exit.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Generous sleep so the test stays reliable under parallel-test CPU load.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // The held connection should still serve queries during the drain window.
     assert_simple_select(&client, "SELECT 7", "7").await;
@@ -417,6 +578,145 @@ async fn graceful_shutdown_drains_active_connection() {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
+    }
+}
+
+// ─── mTLS tests ─────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mtls_required_accepts_signed_client_cert() {
+    let server = spawn_server_mtls("required");
+    let tls = mtls_client_config(&server.bundle, true);
+    let connector = tokio_postgres_rustls::MakeRustlsConnect::new((*tls).clone());
+
+    let conn_str = format!(
+        "host=localhost port={} user=test dbname=postgres sslmode=require",
+        server.server.pgwire_port
+    );
+    let (client, conn) = tokio_postgres::connect(&conn_str, connector)
+        .await
+        .expect("mtls connect should succeed with valid client cert");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    assert_simple_select(&client, "SELECT 1", "1").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mtls_required_rejects_no_client_cert() {
+    let server = spawn_server_mtls("required");
+    let tls = mtls_client_config(&server.bundle, false);
+    let connector = tokio_postgres_rustls::MakeRustlsConnect::new((*tls).clone());
+
+    let conn_str = format!(
+        "host=localhost port={} user=test dbname=postgres sslmode=require",
+        server.server.pgwire_port
+    );
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, connector),
+    )
+    .await;
+    let connect_succeeded = matches!(result, Ok(Ok(_)));
+    assert!(
+        !connect_succeeded,
+        "expected mTLS-required server to reject client without cert"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mtls_optional_allows_no_client_cert() {
+    let server = spawn_server_mtls("optional");
+    let tls = mtls_client_config(&server.bundle, false);
+    let connector = tokio_postgres_rustls::MakeRustlsConnect::new((*tls).clone());
+
+    let conn_str = format!(
+        "host=localhost port={} user=test dbname=postgres sslmode=require",
+        server.server.pgwire_port
+    );
+    let (client, conn) = tokio_postgres::connect(&conn_str, connector)
+        .await
+        .expect("optional mtls should accept client without cert");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    assert_simple_select(&client, "SELECT 1", "1").await;
+}
+
+// ─── SIGHUP cert reload ─────────────────────────────────────────────────────
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sighup_reloads_pgwire_cert() {
+    let server = spawn_server(None);
+    let pid = server.child.id();
+    let original_cert_der = server.cert_der.clone();
+
+    // Round-trip a query so we know the original cert is in use.
+    {
+        let tls = client_tls_config(&original_cert_der);
+        let connector = tokio_postgres_rustls::MakeRustlsConnect::new((*tls).clone());
+        let conn_str = format!(
+            "host=localhost port={} user=test dbname=postgres sslmode=require",
+            server.pgwire_port
+        );
+        let (client, conn) = tokio_postgres::connect(&conn_str, connector)
+            .await
+            .expect("connect with original cert");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        assert_simple_select(&client, "SELECT 1", "1").await;
+    }
+
+    // Generate a fresh cert pair and overwrite the same paths.
+    let (new_cert_pem, new_key_pem, new_cert_der) = make_self_signed();
+    std::fs::write(&server.cert_path, &new_cert_pem).expect("overwrite cert");
+    std::fs::write(&server.key_path, &new_key_pem).expect("overwrite key");
+    assert_ne!(
+        original_cert_der, new_cert_der,
+        "rcgen should produce a distinct cert"
+    );
+
+    // SIGHUP — the server's reload listener picks up the new files.
+    send_sigterm_or_sighup(pid, libc::SIGHUP);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // A client trusting ONLY the new cert should connect successfully.
+    let tls_new = client_tls_config(&new_cert_der);
+    let connector_new = tokio_postgres_rustls::MakeRustlsConnect::new((*tls_new).clone());
+    let conn_str = format!(
+        "host=localhost port={} user=test dbname=postgres sslmode=require",
+        server.pgwire_port
+    );
+    let (client, conn) = tokio_postgres::connect(&conn_str, connector_new)
+        .await
+        .expect("connect with new cert after SIGHUP");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    assert_simple_select(&client, "SELECT 99", "99").await;
+
+    // A client trusting ONLY the OLD cert should now fail — proving the
+    // server is no longer presenting the original.
+    let tls_old = client_tls_config(&original_cert_der);
+    let connector_old = tokio_postgres_rustls::MakeRustlsConnect::new((*tls_old).clone());
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio_postgres::connect(&conn_str, connector_old),
+    )
+    .await;
+    let succeeded = matches!(result, Ok(Ok(_)));
+    assert!(
+        !succeeded,
+        "old-cert client should not be able to connect after SIGHUP reload"
+    );
+}
+
+#[cfg(unix)]
+fn send_sigterm_or_sighup(pid: u32, sig: i32) {
+    unsafe {
+        libc::kill(pid as i32, sig);
     }
 }
 

@@ -1630,6 +1630,7 @@ dependencies = [
 name = "rust-dst-db"
 version = "0.2.0"
 dependencies = [
+ "arc-swap",
  "argon2",
  "async-trait",
  "axum",

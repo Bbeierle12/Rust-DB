@@ -11,8 +11,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use tokio_rustls::TlsAcceptor;
-use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio_rustls::rustls::server::WebPkiClientVerifier;
+use tokio_rustls::rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
 
 /// Errors that can arise while loading TLS material.
 #[derive(Debug)]
@@ -28,6 +29,8 @@ pub enum TlsLoadError {
         key_path: String,
         source: tokio_rustls::rustls::Error,
     },
+    ClientCa(String),
+    ClientVerifier(String),
 }
 
 impl std::fmt::Display for TlsLoadError {
@@ -48,8 +51,22 @@ impl std::fmt::Display for TlsLoadError {
                 "building rustls ServerConfig from cert='{}' key='{}': {}",
                 cert_path, key_path, source
             ),
+            Self::ClientCa(msg) => write!(f, "loading client CA bundle: {}", msg),
+            Self::ClientVerifier(msg) => write!(f, "building client cert verifier: {}", msg),
         }
     }
+}
+
+/// How the server should treat client certificates during the TLS handshake.
+#[derive(Debug, Clone)]
+pub enum ClientAuth {
+    /// Don't ask for a client cert (default).
+    None,
+    /// Ask but don't require. Connections without a cert still proceed; with
+    /// a cert, the chain must validate against `ca_path`.
+    Optional { ca_path: std::path::PathBuf },
+    /// Reject any handshake without a client cert that chains to `ca_path`.
+    Required { ca_path: std::path::PathBuf },
 }
 
 impl std::error::Error for TlsLoadError {}
@@ -105,10 +122,20 @@ pub async fn peek_is_tls(socket: &tokio::net::TcpStream) -> std::io::Result<bool
     }
 }
 
-/// Build a `TlsAcceptor` from PEM-encoded cert and key files.
+/// Build a `TlsAcceptor` from PEM-encoded cert and key files. Equivalent to
+/// `load_acceptor_with_client_auth(..., ClientAuth::None)`.
 pub fn load_acceptor(
     cert_path: impl AsRef<Path>,
     key_path: impl AsRef<Path>,
+) -> Result<Arc<TlsAcceptor>, TlsLoadError> {
+    load_acceptor_with_client_auth(cert_path, key_path, &ClientAuth::None)
+}
+
+/// Build a `TlsAcceptor` with optional or required client-cert authentication.
+pub fn load_acceptor_with_client_auth(
+    cert_path: impl AsRef<Path>,
+    key_path: impl AsRef<Path>,
+    client_auth: &ClientAuth,
 ) -> Result<Arc<TlsAcceptor>, TlsLoadError> {
     let cert_path = cert_path.as_ref();
     let key_path = key_path.as_ref();
@@ -132,8 +159,24 @@ pub fn load_acceptor(
         .map_err(|e| TlsLoadError::ParseKey(key_str.clone(), e))?
         .ok_or_else(|| TlsLoadError::NoPrivateKey(key_str))?;
 
-    let server_config = RustlsServerConfig::builder()
-        .with_no_client_auth()
+    let builder = RustlsServerConfig::builder();
+    let builder_with_auth = match client_auth {
+        ClientAuth::None => builder.with_no_client_auth(),
+        ClientAuth::Optional { ca_path } | ClientAuth::Required { ca_path } => {
+            let roots = load_root_store(ca_path)?;
+            let verifier_builder = WebPkiClientVerifier::builder(Arc::new(roots));
+            let verifier = match client_auth {
+                ClientAuth::Optional { .. } => verifier_builder.allow_unauthenticated(),
+                _ => verifier_builder,
+            };
+            let verifier = verifier
+                .build()
+                .map_err(|e| TlsLoadError::ClientVerifier(e.to_string()))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+    };
+
+    let server_config = builder_with_auth
         .with_single_cert(certs, key)
         .map_err(|source| TlsLoadError::Build {
             cert_path: cert_path.display().to_string(),
@@ -142,6 +185,30 @@ pub fn load_acceptor(
         })?;
 
     Ok(Arc::new(TlsAcceptor::from(Arc::new(server_config))))
+}
+
+fn load_root_store(ca_path: &Path) -> Result<RootCertStore, TlsLoadError> {
+    let f = File::open(ca_path)
+        .map_err(|e| TlsLoadError::ClientCa(format!("opening '{}': {}", ca_path.display(), e)))?;
+    let mut reader = BufReader::new(f);
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<_, _>>()
+        .map_err(|e| {
+            TlsLoadError::ClientCa(format!("parsing PEM '{}': {}", ca_path.display(), e))
+        })?;
+    if certs.is_empty() {
+        return Err(TlsLoadError::ClientCa(format!(
+            "no CA certificates in '{}'",
+            ca_path.display()
+        )));
+    }
+    let mut roots = RootCertStore::empty();
+    for c in certs {
+        roots
+            .add(c)
+            .map_err(|e| TlsLoadError::ClientCa(format!("adding CA cert: {}", e)))?;
+    }
+    Ok(roots)
 }
 
 #[cfg(test)]
