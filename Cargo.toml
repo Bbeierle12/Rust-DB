@@ -15,13 +15,15 @@ required-features = ["server"]
 [features]
 pgwire = ["dep:pgwire", "dep:tokio", "dep:async-trait", "dep:futures"]
 python = ["dep:pyo3"]
-server = ["pgwire", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:axum", "dep:serde", "dep:serde_json", "dep:tower-http", "dep:uuid"]
+server = ["pgwire", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:axum", "dep:serde", "dep:serde_json", "dep:tower-http", "dep:uuid", "dep:toml"]
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 crc32fast = "1"
 bytes = "1"
 sqlparser = "0.53"
+argon2 = "0.5"
+rand = "0.8"
 pgwire      = { version = "0.26", optional = true }
 tokio       = { version = "1",    features = ["full"], optional = true }
 async-trait = { version = "0.1",  optional = true }
@@ -34,6 +36,10 @@ serde              = { version = "1",   features = ["derive"], optional = true }
 serde_json         = { version = "1",   optional = true }
 tower-http         = { version = "0.6", features = ["cors"], optional = true }
 uuid               = { version = "1",   features = ["v4"], optional = true }
+toml               = { version = "0.8", optional = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [patch.crates-io]
 pgwire = { path = "vendor/pgwire" }

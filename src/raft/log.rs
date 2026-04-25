@@ -14,6 +14,12 @@ pub struct RaftLog {
     pub snapshot_last_term: u64,
 }
 
+impl Default for RaftLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RaftLog {
     pub fn new() -> Self {
         Self {

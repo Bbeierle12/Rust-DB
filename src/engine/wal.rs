@@ -29,6 +29,7 @@ impl FileWal {
 
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;
@@ -92,12 +93,8 @@ impl FileWal {
         let mut lsn = 0u64;
 
         while pos + 8 <= buf.len() {
-            let len = u32::from_le_bytes(
-                buf[pos..pos + 4].try_into().unwrap(),
-            ) as usize;
-            let expected_crc = u32::from_le_bytes(
-                buf[pos + 4..pos + 8].try_into().unwrap(),
-            );
+            let len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+            let expected_crc = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap());
 
             if pos + 8 + len > buf.len() {
                 // Truncated record — stop here.
@@ -135,5 +132,10 @@ impl FileWal {
 
     pub fn next_lsn(&self) -> u64 {
         self.next_lsn
+    }
+
+    /// Current on-disk length in bytes (equals total bytes appended since last truncate).
+    pub fn file_len(&self) -> u64 {
+        self.offset
     }
 }

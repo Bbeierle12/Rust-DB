@@ -36,7 +36,12 @@ pub struct SimNetwork {
 
 impl SimNetwork {
     /// Create a new `SimNetwork` using latency values from config.
-    pub fn new(id: ActorId, node_id: impl Into<String>, rng_seed: u64, cfg: &DatabaseConfig) -> Self {
+    pub fn new(
+        id: ActorId,
+        node_id: impl Into<String>,
+        rng_seed: u64,
+        cfg: &DatabaseConfig,
+    ) -> Self {
         Self {
             id,
             node_id: node_id.into(),
@@ -93,26 +98,26 @@ impl StateMachine for SimNetwork {
         self.id
     }
 
-    fn receive(
-        &mut self,
-        from: ActorId,
-        msg: Message,
-    ) -> Option<Vec<(Message, Destination)>> {
+    fn receive(&mut self, from: ActorId, msg: Message) -> Option<Vec<(Message, Destination)>> {
         match msg {
             // ── Outbound: route data to a remote peer ─────────────────────
-            Message::NetSend { conn_id, ref to_node, ref data } => {
+            Message::NetSend {
+                conn_id,
+                ref to_node,
+                ref data,
+            } => {
                 // Check for active partition.
                 if self.is_partitioned(&self.node_id.clone(), to_node) {
                     return Some(vec![(
                         Message::NetSendErr {
                             conn_id,
                             to_node: to_node.clone(),
-                            reason: format!(
-                                "partitioned: {} <-> {}",
-                                self.node_id, to_node
-                            ),
+                            reason: format!("partitioned: {} <-> {}", self.node_id, to_node),
                         },
-                        Destination { actor: from, delay: 0 },
+                        Destination {
+                            actor: from,
+                            delay: 0,
+                        },
                     )]);
                 }
 
@@ -126,7 +131,10 @@ impl StateMachine for SimNetwork {
                                 to_node: to_node.clone(),
                                 reason: format!("unknown peer: {}", to_node),
                             },
-                            Destination { actor: from, delay: 0 },
+                            Destination {
+                                actor: from,
+                                delay: 0,
+                            },
                         )]);
                     }
                 };
@@ -142,7 +150,10 @@ impl StateMachine for SimNetwork {
                             from_node,
                             data: data.clone(),
                         },
-                        Destination { actor: peer_actor, delay },
+                        Destination {
+                            actor: peer_actor,
+                            delay,
+                        },
                     ),
                     // Ack to the local sender immediately.
                     (
@@ -150,7 +161,10 @@ impl StateMachine for SimNetwork {
                             conn_id,
                             to_node: to_node.clone(),
                         },
-                        Destination { actor: from, delay: 0 },
+                        Destination {
+                            actor: from,
+                            delay: 0,
+                        },
                     ),
                 ])
             }
@@ -158,7 +172,13 @@ impl StateMachine for SimNetwork {
             // ── Inbound: forward NetRecv to the local application ─────────
             Message::NetRecv { .. } => {
                 if let Some(app) = self.app_actor {
-                    Some(vec![(msg, Destination { actor: app, delay: 0 })])
+                    Some(vec![(
+                        msg,
+                        Destination {
+                            actor: app,
+                            delay: 0,
+                        },
+                    )])
                 } else {
                     // No app registered — message is delivered here (for tests
                     // that directly inspect SimNetwork state or use it as sink).
@@ -169,20 +189,38 @@ impl StateMachine for SimNetwork {
             // ── Connection lifecycle ───────────────────────────────────────
             Message::NetConnect { conn_id, ref node } => {
                 let reply = if self.peers.contains_key(node.as_str()) {
-                    Message::NetConnected { conn_id, node: node.clone() }
+                    Message::NetConnected {
+                        conn_id,
+                        node: node.clone(),
+                    }
                 } else {
-                    Message::NetDisconnected { conn_id, node: node.clone() }
+                    Message::NetDisconnected {
+                        conn_id,
+                        node: node.clone(),
+                    }
                 };
-                Some(vec![(reply, Destination { actor: from, delay: 0 })])
+                Some(vec![(
+                    reply,
+                    Destination {
+                        actor: from,
+                        delay: 0,
+                    },
+                )])
             }
 
             // ── Simulation control ─────────────────────────────────────────
-            Message::NetPartition { ref node_a, ref node_b } => {
+            Message::NetPartition {
+                ref node_a,
+                ref node_b,
+            } => {
                 self.partitions.insert(canonical_pair(node_a, node_b));
                 None
             }
 
-            Message::NetHeal { ref node_a, ref node_b } => {
+            Message::NetHeal {
+                ref node_a,
+                ref node_b,
+            } => {
                 self.partitions.remove(&canonical_pair(node_a, node_b));
                 None
             }

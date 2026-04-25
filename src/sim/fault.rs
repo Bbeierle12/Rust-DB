@@ -51,11 +51,7 @@ impl FaultInjector {
 
     /// Inspect an envelope and decide whether to drop, corrupt, or pass it.
     /// Returns None if the message should be dropped.
-    pub fn maybe_fault(
-        &self,
-        envelope: &mut Envelope,
-        rng: &mut SeededRng,
-    ) -> FaultAction {
+    pub fn maybe_fault(&self, envelope: &mut Envelope, rng: &mut SeededRng) -> FaultAction {
         // Check for message drop.
         if rng.chance(self.config.drop_probability) {
             return FaultAction::Drop;
@@ -75,7 +71,11 @@ impl FaultInjector {
                     return FaultAction::Mutated;
                 }
             }
-            Message::DiskReadOk { file_id, offset, data } => {
+            Message::DiskReadOk {
+                file_id,
+                offset,
+                data,
+            } => {
                 if rng.chance(self.config.corruption_probability) {
                     let mut corrupted = data.clone();
                     if !corrupted.is_empty() {

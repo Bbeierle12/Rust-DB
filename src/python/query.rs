@@ -30,7 +30,9 @@ pub struct PyQueryBuilder {
 impl PyQueryBuilder {
     #[staticmethod]
     fn from_schema(schema: PyRef<'_, PySchema>) -> Self {
-        Self { plan: QueryBuilder::from(schema.inner.clone()).build() }
+        Self {
+            plan: QueryBuilder::from(schema.inner.clone()).build(),
+        }
     }
 
     fn filter(&self, expr: PyRef<'_, PyExpr>) -> Self {
@@ -41,13 +43,17 @@ impl PyQueryBuilder {
     }
 
     fn select(&self, columns: Vec<String>) -> Self {
-        let plan = QueryBuilder::from_plan(self.plan.clone()).select(columns).build();
+        let plan = QueryBuilder::from_plan(self.plan.clone())
+            .select(columns)
+            .build();
         PyQueryBuilder { plan }
     }
 
     fn order_by(&self, col: String, asc: bool) -> Self {
         let order = if asc { SortOrder::Asc } else { SortOrder::Desc };
-        let plan = QueryBuilder::from_plan(self.plan.clone()).order_by(col, order).build();
+        let plan = QueryBuilder::from_plan(self.plan.clone())
+            .order_by(col, order)
+            .build();
         PyQueryBuilder { plan }
     }
 
@@ -57,7 +63,9 @@ impl PyQueryBuilder {
     }
 
     fn build(&self) -> PyPlan {
-        PyPlan { inner: self.plan.clone() }
+        PyPlan {
+            inner: self.plan.clone(),
+        }
     }
 }
 

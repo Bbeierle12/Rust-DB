@@ -8,6 +8,9 @@ use crate::txn::mvcc::MvccStore;
 /// WAL record types for transaction recovery.
 const WAL_TXN_COMMIT: u8 = 10;
 
+/// Decoded commit-record writes: list of (key, optional value) pairs.
+type CommitWrites = Vec<(Vec<u8>, Option<Vec<u8>>)>;
+
 /// State of an active transaction.
 #[derive(Debug)]
 struct ActiveTxn {
@@ -96,9 +99,7 @@ impl TransactionManager {
 
     /// Decode a WAL commit record.
     /// Returns (txn_id, commit_ts, writes: Vec<(key, Option<value>)>).
-    pub fn decode_commit_record(
-        data: &[u8],
-    ) -> Option<(u64, u64, Vec<(Vec<u8>, Option<Vec<u8>>)>)> {
+    pub fn decode_commit_record(data: &[u8]) -> Option<(u64, u64, CommitWrites)> {
         if data.is_empty() || data[0] != WAL_TXN_COMMIT {
             return None;
         }
@@ -116,15 +117,13 @@ impl TransactionManager {
             let is_delete = *data.get(pos)?;
             pos += 1;
 
-            let key_len =
-                u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
+            let key_len = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
             pos += 4;
             let key = data.get(pos..pos + key_len)?.to_vec();
             pos += key_len;
 
             if is_delete == 0 {
-                let val_len =
-                    u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
+                let val_len = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
                 pos += 4;
                 let value = data.get(pos..pos + val_len)?.to_vec();
                 pos += val_len;
@@ -269,10 +268,7 @@ impl StateMachine for TransactionManager {
                         Some(vec![(
                             Message::TxnCommitErr {
                                 txn_id,
-                                reason: format!(
-                                    "write-write conflict on key {:?}",
-                                    key
-                                ),
+                                reason: format!("write-write conflict on key {:?}", key),
                             },
                             Destination {
                                 actor: from,
@@ -342,11 +338,7 @@ impl StateMachine for TransactionManager {
                 )])
             }
 
-            Message::TxnScan {
-                txn_id,
-                start,
-                end,
-            } => {
+            Message::TxnScan { txn_id, start, end } => {
                 let entries = if let Some(txn) = self.active.get(&txn_id) {
                     // Get committed entries visible at snapshot.
                     let mut entries =
@@ -361,16 +353,14 @@ impl StateMachine for TransactionManager {
                     }
                     for (k, v) in &txn.write_set {
                         // Check range bounds.
-                        if let Some(ref s) = start {
-                            if k.as_slice() < s.as_slice() {
+                        if let Some(ref s) = start
+                            && k.as_slice() < s.as_slice() {
                                 continue;
                             }
-                        }
-                        if let Some(ref e) = end {
-                            if k.as_slice() >= e.as_slice() {
+                        if let Some(ref e) = end
+                            && k.as_slice() >= e.as_slice() {
                                 continue;
                             }
-                        }
                         merged.insert(k.clone(), v.clone());
                     }
 

@@ -63,27 +63,36 @@ fn decode_command(data: &[u8]) -> Option<Message> {
     match tag {
         0 => Some(Message::TxnBegin),
         1 => {
-            if data.len() < 9 { return None; }
+            if data.len() < 9 {
+                return None;
+            }
             let txn_id = u64::from_le_bytes(data[1..9].try_into().ok()?);
             let key_len = u32::from_le_bytes(data.get(9..13)?.try_into().ok()?) as usize;
             let key = data.get(13..13 + key_len)?.to_vec();
             let val_start = 13 + key_len;
-            let val_len = u32::from_le_bytes(data.get(val_start..val_start + 4)?.try_into().ok()?) as usize;
+            let val_len =
+                u32::from_le_bytes(data.get(val_start..val_start + 4)?.try_into().ok()?) as usize;
             let value = data.get(val_start + 4..val_start + 4 + val_len)?.to_vec();
             Some(Message::TxnPut { txn_id, key, value })
         }
         2 => {
-            if data.len() < 9 { return None; }
+            if data.len() < 9 {
+                return None;
+            }
             let txn_id = u64::from_le_bytes(data[1..9].try_into().ok()?);
             Some(Message::TxnCommit { txn_id })
         }
         3 => {
-            if data.len() < 9 { return None; }
+            if data.len() < 9 {
+                return None;
+            }
             let txn_id = u64::from_le_bytes(data[1..9].try_into().ok()?);
             Some(Message::TxnAbort { txn_id })
         }
         4 => {
-            if data.len() < 9 { return None; }
+            if data.len() < 9 {
+                return None;
+            }
             let txn_id = u64::from_le_bytes(data[1..9].try_into().ok()?);
             let key_len = u32::from_le_bytes(data.get(9..13)?.try_into().ok()?) as usize;
             let key = data.get(13..13 + key_len)?.to_vec();
@@ -186,18 +195,27 @@ impl RaftServer {
         self.peers.insert(node_id.into(), actor);
     }
 
-    pub fn role(&self) -> &ServerRole { &self.role }
-    pub fn leader_id(&self) -> Option<&str> { self.leader_id.as_deref() }
-    pub fn log_last_index(&self) -> u64 { self.log.last_index() }
+    pub fn role(&self) -> &ServerRole {
+        &self.role
+    }
+    pub fn leader_id(&self) -> Option<&str> {
+        self.leader_id.as_deref()
+    }
+    pub fn log_last_index(&self) -> u64 {
+        self.log.last_index()
+    }
 
-    fn cluster_size(&self) -> usize { self.peers.len() + 1 }
+    fn cluster_size(&self) -> usize {
+        self.peers.len() + 1
+    }
 
     fn has_majority(&self, count: usize) -> bool {
-        count >= self.cluster_size() / 2 + 1
+        count > self.cluster_size() / 2
     }
 
     fn is_partitioned_from(&self, peer: &str) -> bool {
-        self.partitions.contains(&canonical_pair(&self.node_id, peer))
+        self.partitions
+            .contains(&canonical_pair(&self.node_id, peer))
     }
 
     fn become_follower(&mut self, term: u64) {
@@ -230,10 +248,20 @@ impl RaftServer {
         let last_log_term = self.log.last_term();
 
         for (peer_id, &peer_actor) in &self.peers {
-            if self.is_partitioned_from(peer_id) { continue; }
+            if self.is_partitioned_from(peer_id) {
+                continue;
+            }
             msgs.push((
-                Message::RaftRequestVote { term, candidate_id: candidate_id.clone(), last_log_index, last_log_term },
-                Destination { actor: peer_actor, delay: 0 },
+                Message::RaftRequestVote {
+                    term,
+                    candidate_id: candidate_id.clone(),
+                    last_log_index,
+                    last_log_term,
+                },
+                Destination {
+                    actor: peer_actor,
+                    delay: 0,
+                },
             ));
         }
     }
@@ -257,7 +285,9 @@ impl RaftServer {
     fn build_heartbeats(&self) -> Vec<(Message, Destination)> {
         let mut msgs = Vec::new();
         for (peer_id, &peer_actor) in &self.peers {
-            if self.is_partitioned_from(peer_id) { continue; }
+            if self.is_partitioned_from(peer_id) {
+                continue;
+            }
             let next = *self.next_index.get(peer_id.as_str()).unwrap_or(&1);
 
             // Check if follower needs a snapshot.
@@ -267,7 +297,7 @@ impl RaftServer {
             }
 
             let entries = self.log.get_entries_from(next);
-            let prev_log_index = if next > 1 { next - 1 } else { 0 };
+            let prev_log_index = next.saturating_sub(1);
             let prev_log_term = self.log.term_at(prev_log_index).unwrap_or(0);
             msgs.push((
                 Message::RaftAppendEntries {
@@ -278,7 +308,10 @@ impl RaftServer {
                     entries,
                     leader_commit: self.commit_index,
                 },
-                Destination { actor: peer_actor, delay: 0 },
+                Destination {
+                    actor: peer_actor,
+                    delay: 0,
+                },
             ));
         }
         msgs
@@ -291,10 +324,14 @@ impl RaftServer {
         let mut new_commit = self.commit_index;
 
         for idx in (self.commit_index + 1)..=last {
-            if self.log.term_at(idx) != Some(self.current_term) { continue; }
+            if self.log.term_at(idx) != Some(self.current_term) {
+                continue;
+            }
             let mut count = 1; // self
             for match_idx in self.match_index.values() {
-                if *match_idx >= idx { count += 1; }
+                if *match_idx >= idx {
+                    count += 1;
+                }
             }
             if self.has_majority(count) {
                 new_commit = idx;
@@ -327,7 +364,13 @@ impl RaftServer {
                     // This node is (or was) the leader — track for response forwarding.
                     self.waiting_for_txn = Some(req);
                 }
-                msgs.push((txn_msg, Destination { actor: self.txn_actor, delay: 0 }));
+                msgs.push((
+                    txn_msg,
+                    Destination {
+                        actor: self.txn_actor,
+                        delay: 0,
+                    },
+                ));
             }
         }
         msgs
@@ -350,7 +393,9 @@ fn random_timeout(cfg: &DatabaseConfig, rng: &mut SeededRng) -> u64 {
 }
 
 impl StateMachine for RaftServer {
-    fn id(&self) -> ActorId { self.id }
+    fn id(&self) -> ActorId {
+        self.id
+    }
 
     fn tick(&mut self, now: u64) -> Option<Vec<(Message, Destination)>> {
         self.now = now;
@@ -395,13 +440,19 @@ impl StateMachine for RaftServer {
             }
 
             // ── RequestVote ───────────────────────────────────────────────
-            Message::RaftRequestVote { term, candidate_id, last_log_index, last_log_term } => {
+            Message::RaftRequestVote {
+                term,
+                candidate_id,
+                last_log_index,
+                last_log_term,
+            } => {
                 if term > self.current_term {
                     self.become_follower(term);
                 }
 
                 let can_vote = term >= self.current_term
-                    && (self.voted_for.is_none() || self.voted_for.as_deref() == Some(&candidate_id))
+                    && (self.voted_for.is_none()
+                        || self.voted_for.as_deref() == Some(&candidate_id))
                     && self.log.is_up_to_date(last_log_term, last_log_index);
 
                 if can_vote {
@@ -410,7 +461,10 @@ impl StateMachine for RaftServer {
                     let sender = self.peers.get(&candidate_id).copied();
                     if let Some(actor) = sender {
                         msgs.push((
-                            Message::RaftVoteGranted { term: self.current_term, from: self.node_id.clone() },
+                            Message::RaftVoteGranted {
+                                term: self.current_term,
+                                from: self.node_id.clone(),
+                            },
                             Destination { actor, delay: 0 },
                         ));
                     }
@@ -418,7 +472,10 @@ impl StateMachine for RaftServer {
                     let sender = self.peers.get(&candidate_id).copied();
                     if let Some(actor) = sender {
                         msgs.push((
-                            Message::RaftVoteDenied { term: self.current_term, from: self.node_id.clone() },
+                            Message::RaftVoteDenied {
+                                term: self.current_term,
+                                from: self.node_id.clone(),
+                            },
                             Destination { actor, delay: 0 },
                         ));
                     }
@@ -444,13 +501,24 @@ impl StateMachine for RaftServer {
             }
 
             // ── AppendEntries ─────────────────────────────────────────────
-            Message::RaftAppendEntries { term, leader_id, prev_log_index, prev_log_term, entries, leader_commit } => {
+            Message::RaftAppendEntries {
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            } => {
                 let sender = self.peers.get(&leader_id).copied();
 
                 if term < self.current_term {
                     if let Some(actor) = sender {
                         msgs.push((
-                            Message::RaftAppendEntriesErr { term: self.current_term, from: self.node_id.clone(), reason: "stale term".into() },
+                            Message::RaftAppendEntriesErr {
+                                term: self.current_term,
+                                from: self.node_id.clone(),
+                                reason: "stale term".into(),
+                            },
                             Destination { actor, delay: 0 },
                         ));
                     }
@@ -476,7 +544,11 @@ impl StateMachine for RaftServer {
                         _ => {
                             if let Some(actor) = sender {
                                 msgs.push((
-                                    Message::RaftAppendEntriesErr { term: self.current_term, from: self.node_id.clone(), reason: "log inconsistency".into() },
+                                    Message::RaftAppendEntriesErr {
+                                        term: self.current_term,
+                                        from: self.node_id.clone(),
+                                        reason: "log inconsistency".into(),
+                                    },
                                     Destination { actor, delay: 0 },
                                 ));
                             }
@@ -508,18 +580,28 @@ impl StateMachine for RaftServer {
 
                 if let Some(actor) = sender {
                     msgs.push((
-                        Message::RaftAppendEntriesOk { term: self.current_term, from: self.node_id.clone(), match_index: self.log.last_index() },
+                        Message::RaftAppendEntriesOk {
+                            term: self.current_term,
+                            from: self.node_id.clone(),
+                            match_index: self.log.last_index(),
+                        },
                         Destination { actor, delay: 0 },
                     ));
                 }
             }
 
-            Message::RaftAppendEntriesOk { term, from, match_index } => {
+            Message::RaftAppendEntriesOk {
+                term,
+                from,
+                match_index,
+            } => {
                 if term > self.current_term {
                     self.become_follower(term);
                     return None;
                 }
-                if !matches!(self.role, ServerRole::Leader) { return None; }
+                if !matches!(self.role, ServerRole::Leader) {
+                    return None;
+                }
 
                 // Update match/next index.
                 self.match_index.insert(from.clone(), match_index);
@@ -534,16 +616,20 @@ impl StateMachine for RaftServer {
                     self.become_follower(term);
                     return None;
                 }
-                if !matches!(self.role, ServerRole::Leader) { return None; }
+                if !matches!(self.role, ServerRole::Leader) {
+                    return None;
+                }
 
                 // Decrement next_index and retry.
                 let next = self.next_index.entry(from.clone()).or_insert(1);
-                if *next > 1 { *next -= 1; }
+                if *next > 1 {
+                    *next -= 1;
+                }
                 let retry_next = *next;
 
                 if let Some(&peer_actor) = self.peers.get(&from) {
                     let entries = self.log.get_entries_from(retry_next);
-                    let prev_log_index = if retry_next > 1 { retry_next - 1 } else { 0 };
+                    let prev_log_index = retry_next.saturating_sub(1);
                     let prev_log_term = self.log.term_at(prev_log_index).unwrap_or(0);
                     msgs.push((
                         Message::RaftAppendEntries {
@@ -554,14 +640,25 @@ impl StateMachine for RaftServer {
                             entries,
                             leader_commit: self.commit_index,
                         },
-                        Destination { actor: peer_actor, delay: 0 },
+                        Destination {
+                            actor: peer_actor,
+                            delay: 0,
+                        },
                     ));
                 }
             }
 
             // ── Snapshot install ──────────────────────────────────────────
-            Message::RaftInstallSnapshot { term, leader_id, last_included_index, last_included_term, .. } => {
-                if term < self.current_term { return None; }
+            Message::RaftInstallSnapshot {
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                ..
+            } => {
+                if term < self.current_term {
+                    return None;
+                }
                 if term > self.current_term {
                     self.become_follower(term);
                 }
@@ -575,8 +672,14 @@ impl StateMachine for RaftServer {
 
                 if let Some(&peer_actor) = self.peers.get(&leader_id) {
                     msgs.push((
-                        Message::RaftInstallSnapshotOk { term: self.current_term, from: self.node_id.clone() },
-                        Destination { actor: peer_actor, delay: 0 },
+                        Message::RaftInstallSnapshotOk {
+                            term: self.current_term,
+                            from: self.node_id.clone(),
+                        },
+                        Destination {
+                            actor: peer_actor,
+                            delay: 0,
+                        },
                     ));
                 }
             }
@@ -586,7 +689,9 @@ impl StateMachine for RaftServer {
                     self.become_follower(term);
                     return None;
                 }
-                if !matches!(self.role, ServerRole::Leader) { return None; }
+                if !matches!(self.role, ServerRole::Leader) {
+                    return None;
+                }
                 // Update match/next index after snapshot.
                 let snap_idx = self.log.snapshot_last_index;
                 self.match_index.insert(from.clone(), snap_idx);
@@ -595,8 +700,11 @@ impl StateMachine for RaftServer {
             }
 
             // ── Client commands ───────────────────────────────────────────
-            Message::TxnBegin | Message::TxnPut { .. } | Message::TxnCommit { .. }
-            | Message::TxnAbort { .. } | Message::TxnDelete { .. } => {
+            Message::TxnBegin
+            | Message::TxnPut { .. }
+            | Message::TxnCommit { .. }
+            | Message::TxnAbort { .. }
+            | Message::TxnDelete { .. } => {
                 match self.role {
                     ServerRole::Leader => {
                         let data = encode_command(&msg);
@@ -617,18 +725,32 @@ impl StateMachine for RaftServer {
                     _ => {
                         // Redirect to leader.
                         msgs.push((
-                            Message::RaftRedirect { leader_id: self.leader_id.clone() },
-                            Destination { actor: _from, delay: 0 },
+                            Message::RaftRedirect {
+                                leader_id: self.leader_id.clone(),
+                            },
+                            Destination {
+                                actor: _from,
+                                delay: 0,
+                            },
                         ));
                     }
                 }
             }
 
             // ── TxnManager responses (forward to pending client) ──────────
-            Message::TxnBeginOk { .. } | Message::TxnPutOk { .. } | Message::TxnCommitOk { .. }
-            | Message::TxnCommitErr { .. } | Message::TxnAbortOk { .. } => {
+            Message::TxnBeginOk { .. }
+            | Message::TxnPutOk { .. }
+            | Message::TxnCommitOk { .. }
+            | Message::TxnCommitErr { .. }
+            | Message::TxnAbortOk { .. } => {
                 if let Some(requester) = self.waiting_for_txn.take() {
-                    msgs.push((msg, Destination { actor: requester, delay: 0 }));
+                    msgs.push((
+                        msg,
+                        Destination {
+                            actor: requester,
+                            delay: 0,
+                        },
+                    ));
                 }
             }
 
@@ -638,5 +760,7 @@ impl StateMachine for RaftServer {
         if msgs.is_empty() { None } else { Some(msgs) }
     }
 
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }

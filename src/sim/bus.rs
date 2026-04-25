@@ -79,18 +79,14 @@ impl MessageBus {
 
         // Process waves: deliver all messages at `now`, including any new
         // messages enqueued at `now` by handlers (delay=0 responses).
-        loop {
-            let envelopes = match self.queue.remove(&now) {
-                Some(mut e) => {
-                    e.sort();
-                    e
-                }
-                None => break,
-            };
+        while let Some(mut envelopes) = self.queue.remove(&now) {
+            envelopes.sort();
 
             for mut envelope in envelopes {
                 // Run fault injection.
-                let action = self.fault_injector.maybe_fault(&mut envelope, &mut self.rng);
+                let action = self
+                    .fault_injector
+                    .maybe_fault(&mut envelope, &mut self.rng);
                 match action {
                     FaultAction::Drop => {
                         self.trace.push((
@@ -138,17 +134,13 @@ impl MessageBus {
         }
 
         // Second wave: process any messages that actor ticks just enqueued at `now`.
-        loop {
-            let envelopes = match self.queue.remove(&now) {
-                Some(mut e) => {
-                    e.sort();
-                    e
-                }
-                None => break,
-            };
+        while let Some(mut envelopes) = self.queue.remove(&now) {
+            envelopes.sort();
 
             for mut envelope in envelopes {
-                let action = self.fault_injector.maybe_fault(&mut envelope, &mut self.rng);
+                let action = self
+                    .fault_injector
+                    .maybe_fault(&mut envelope, &mut self.rng);
                 match action {
                     FaultAction::Drop => {
                         self.trace.push((
@@ -163,7 +155,8 @@ impl MessageBus {
                 }
 
                 let msg_debug = format!("{:?}", envelope.message);
-                self.trace.push((now, envelope.from, envelope.to, msg_debug));
+                self.trace
+                    .push((now, envelope.from, envelope.to, msg_debug));
 
                 if let Some(actor) = self.actors.remove(&envelope.to) {
                     let mut actor = actor;

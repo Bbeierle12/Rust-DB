@@ -42,10 +42,25 @@ fn setup_storage(
     let mut bus = MessageBus::new(seed, injector, &cfg);
 
     bus.register(Box::new(SimDisk::new(DISK_ID, false, &cfg)));
-    bus.register(Box::new(WalWriter::new(WAL_WRITER_ID, DISK_ID, BTREE_ID, &cfg)));
-    bus.register(Box::new(WalReader::new(WAL_READER_ID, DISK_ID, CLIENT_ID, &cfg)));
+    bus.register(Box::new(WalWriter::new(
+        WAL_WRITER_ID,
+        DISK_ID,
+        BTREE_ID,
+        &cfg,
+    )));
+    bus.register(Box::new(WalReader::new(
+        WAL_READER_ID,
+        DISK_ID,
+        CLIENT_ID,
+        &cfg,
+    )));
     bus.register(Box::new(BufferPool::new(BUF_POOL_ID, DISK_ID, &cfg)));
-    bus.register(Box::new(BTreeEngine::new(BTREE_ID, BUF_POOL_ID, WAL_WRITER_ID, &cfg)));
+    bus.register(Box::new(BTreeEngine::new(
+        BTREE_ID,
+        BUF_POOL_ID,
+        WAL_WRITER_ID,
+        &cfg,
+    )));
     bus.register(Box::new(Collector::new(CLIENT_ID)));
 
     bus
@@ -290,12 +305,7 @@ fn btree_leaf_split() {
 
     // Verify all 5 entries are retrievable.
     for i in 0u8..5 {
-        bus.send(
-            CLIENT_ID,
-            BTREE_ID,
-            Message::BTreeGet { key: vec![i] },
-            0,
-        );
+        bus.send(CLIENT_ID, BTREE_ID, Message::BTreeGet { key: vec![i] }, 0);
     }
     bus.run(1000);
 
@@ -320,7 +330,10 @@ fn btree_leaf_split() {
 
     // The tree should have more than 1 node (split occurred).
     let btree = bus.actor::<BTreeEngine>(BTREE_ID).unwrap();
-    assert!(btree.node_count() > 1, "Split should have created new nodes");
+    assert!(
+        btree.node_count() > 1,
+        "Split should have created new nodes"
+    );
 }
 
 #[test]
@@ -344,12 +357,7 @@ fn btree_multi_level_split() {
 
     // Verify all 20 entries.
     for i in 0u8..20 {
-        bus.send(
-            CLIENT_ID,
-            BTREE_ID,
-            Message::BTreeGet { key: vec![i] },
-            0,
-        );
+        bus.send(CLIENT_ID, BTREE_ID, Message::BTreeGet { key: vec![i] }, 0);
     }
     bus.run(2000);
 
@@ -500,12 +508,7 @@ fn buffer_pool_eviction() {
 
     // All keys should still be retrievable (they're in the B-tree's in-memory state).
     for i in 0u8..20 {
-        bus.send(
-            CLIENT_ID,
-            BTREE_ID,
-            Message::BTreeGet { key: vec![i] },
-            0,
-        );
+        bus.send(CLIENT_ID, BTREE_ID, Message::BTreeGet { key: vec![i] }, 0);
     }
     bus.run(2000);
 
@@ -524,7 +527,11 @@ fn buffer_pool_eviction() {
 
     assert_eq!(gets.len(), 20);
     for (key, value) in &gets {
-        assert!(value.is_some(), "Key {:?} should be found despite eviction", key);
+        assert!(
+            value.is_some(),
+            "Key {:?} should be found despite eviction",
+            key
+        );
     }
 
     // Buffer pool should have at most 4 pages cached.
@@ -550,9 +557,7 @@ fn btree_crash_recovery_via_wal() {
     // Phase 1: Write data.
     let mut bus = setup_default(42);
 
-    let test_data: Vec<(Vec<u8>, Vec<u8>)> = (0u8..8)
-        .map(|i| (vec![i], vec![i * 10]))
-        .collect();
+    let test_data: Vec<(Vec<u8>, Vec<u8>)> = (0u8..8).map(|i| (vec![i], vec![i * 10])).collect();
 
     for (key, value) in &test_data {
         bus.send(
@@ -586,7 +591,12 @@ fn btree_crash_recovery_via_wal() {
 
     // Phase 3: Create fresh B-tree and replay WAL.
     let injector = FaultInjector::new(FaultConfig::none());
-    let cfg2 = DatabaseConfig { btree_max_leaf_entries: 4, btree_max_internal_keys: 4, buffer_pool_pages: 64, ..DatabaseConfig::default() };
+    let cfg2 = DatabaseConfig {
+        btree_max_leaf_entries: 4,
+        btree_max_internal_keys: 4,
+        buffer_pool_pages: 64,
+        ..DatabaseConfig::default()
+    };
     let mut bus2 = MessageBus::new(42, injector, &cfg2);
 
     bus2.register(Box::new(SimDisk::new(DISK_ID, false, &cfg2)));
@@ -679,7 +689,11 @@ fn btree_crash_recovery_with_deletes() {
     };
 
     // Replay on fresh tree.
-    let cfg_fresh = DatabaseConfig { btree_max_leaf_entries: 4, btree_max_internal_keys: 4, ..DatabaseConfig::default() };
+    let cfg_fresh = DatabaseConfig {
+        btree_max_leaf_entries: 4,
+        btree_max_internal_keys: 4,
+        ..DatabaseConfig::default()
+    };
     let mut fresh = BTreeEngine::new(BTREE_ID, BUF_POOL_ID, WAL_WRITER_ID, &cfg_fresh);
     fresh.replay_wal(&records);
 
@@ -692,12 +706,7 @@ fn btree_crash_recovery_with_deletes() {
 
     // Check all keys.
     for i in 0u8..6 {
-        bus2.send(
-            CLIENT_ID,
-            BTREE_ID,
-            Message::BTreeGet { key: vec![i] },
-            0,
-        );
+        bus2.send(CLIENT_ID, BTREE_ID, Message::BTreeGet { key: vec![i] }, 0);
     }
     bus2.run(500);
 
@@ -756,12 +765,7 @@ fn btree_survives_io_faults() {
 
     // All keys should be in the in-memory tree.
     for i in 0u8..15 {
-        bus.send(
-            CLIENT_ID,
-            BTREE_ID,
-            Message::BTreeGet { key: vec![i] },
-            0,
-        );
+        bus.send(CLIENT_ID, BTREE_ID, Message::BTreeGet { key: vec![i] }, 0);
     }
     bus.run(2000);
 
@@ -780,7 +784,11 @@ fn btree_survives_io_faults() {
 
     assert_eq!(gets.len(), 15);
     for (key, value) in &gets {
-        assert!(value.is_some(), "Key {:?} should exist despite IO faults", key);
+        assert!(
+            value.is_some(),
+            "Key {:?} should exist despite IO faults",
+            key
+        );
     }
 }
 

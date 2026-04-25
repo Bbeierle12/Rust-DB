@@ -147,10 +147,7 @@ fn expr_logical_operators() {
     );
     assert_eq!(or_expr.eval(&row), Value::Bool(true));
 
-    assert_eq!(
-        Expr::not(Expr::lit(false)).eval(&row),
-        Value::Bool(true)
-    );
+    assert_eq!(Expr::not(Expr::lit(false)).eval(&row), Value::Bool(true));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -452,11 +449,7 @@ fn sql_select_with_where() {
     let schema = make_schema();
     let rows = sample_rows();
 
-    let plan = sql_to_plan(
-        "SELECT * FROM users WHERE age > 27",
-        schema,
-    )
-    .expect("parse failed");
+    let plan = sql_to_plan("SELECT * FROM users WHERE age > 27", schema).expect("parse failed");
 
     let result = execute(&plan, rows);
     assert_eq!(result.len(), 3); // Alice(30), Carol(35), Eve(28)
@@ -483,8 +476,7 @@ fn sql_select_order_by() {
     let schema = make_schema();
     let rows = sample_rows();
 
-    let plan = sql_to_plan("SELECT * FROM users ORDER BY age ASC", schema)
-        .expect("parse failed");
+    let plan = sql_to_plan("SELECT * FROM users ORDER BY age ASC", schema).expect("parse failed");
     let result = execute(&plan, rows);
 
     let ages: Vec<i64> = result
@@ -524,8 +516,7 @@ fn sql_select_sum() {
     let schema = make_schema();
     let rows = sample_rows();
 
-    let plan = sql_to_plan("SELECT SUM(age) AS total FROM users", schema)
-        .expect("parse failed");
+    let plan = sql_to_plan("SELECT SUM(age) AS total FROM users", schema).expect("parse failed");
     let result = execute(&plan, rows);
 
     assert_eq!(result.len(), 1);
@@ -613,8 +604,12 @@ fn cross_join_two_tables() {
     let orders_schema = make_orders_schema();
 
     let plan = LogicalPlan::Join {
-        left: Box::new(LogicalPlan::Scan { schema: users_schema }),
-        right: Box::new(LogicalPlan::Scan { schema: orders_schema }),
+        left: Box::new(LogicalPlan::Scan {
+            schema: users_schema,
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            schema: orders_schema,
+        }),
         join_type: JoinType::Cross,
         on: None,
     };
@@ -634,8 +629,12 @@ fn inner_join_on_condition() {
     let orders_schema = make_orders_schema();
 
     let plan = LogicalPlan::Join {
-        left: Box::new(LogicalPlan::Scan { schema: users_schema }),
-        right: Box::new(LogicalPlan::Scan { schema: orders_schema }),
+        left: Box::new(LogicalPlan::Scan {
+            schema: users_schema,
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            schema: orders_schema,
+        }),
         join_type: JoinType::Inner,
         on: Some(Expr::eq(Expr::col("users.id"), Expr::col("orders.user_id"))),
     };
@@ -646,12 +645,13 @@ fn inner_join_on_condition() {
     // User 9 has no matching user, so order 103 is excluded.
     assert_eq!(result.len(), 3);
 
-    let order_ids: Vec<i64> = result.iter().filter_map(|r| {
-        match r.get("orders.order_id") {
+    let order_ids: Vec<i64> = result
+        .iter()
+        .filter_map(|r| match r.get("orders.order_id") {
             Some(Value::Int64(n)) => Some(*n),
             _ => None,
-        }
-    }).collect();
+        })
+        .collect();
     assert!(order_ids.contains(&100));
     assert!(order_ids.contains(&101));
     assert!(order_ids.contains(&102));
@@ -663,8 +663,12 @@ fn left_join_null_padding() {
     let orders_schema = make_orders_schema();
 
     let plan = LogicalPlan::Join {
-        left: Box::new(LogicalPlan::Scan { schema: users_schema }),
-        right: Box::new(LogicalPlan::Scan { schema: orders_schema }),
+        left: Box::new(LogicalPlan::Scan {
+            schema: users_schema,
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            schema: orders_schema,
+        }),
         join_type: JoinType::Left,
         on: Some(Expr::eq(Expr::col("users.id"), Expr::col("orders.user_id"))),
     };
@@ -675,9 +679,10 @@ fn left_join_null_padding() {
     assert_eq!(result.len(), 6);
 
     // Find Carol (id=3) who has no orders.
-    let carol_rows: Vec<_> = result.iter().filter(|r| {
-        r.get("users.name") == Some(&Value::Text("Carol".into()))
-    }).collect();
+    let carol_rows: Vec<_> = result
+        .iter()
+        .filter(|r| r.get("users.name") == Some(&Value::Text("Carol".into())))
+        .collect();
     assert_eq!(carol_rows.len(), 1);
     assert_eq!(carol_rows[0].get("orders.order_id"), Some(&Value::Null));
 }
@@ -688,8 +693,12 @@ fn right_join_null_padding() {
     let orders_schema = make_orders_schema();
 
     let plan = LogicalPlan::Join {
-        left: Box::new(LogicalPlan::Scan { schema: users_schema }),
-        right: Box::new(LogicalPlan::Scan { schema: orders_schema }),
+        left: Box::new(LogicalPlan::Scan {
+            schema: users_schema,
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            schema: orders_schema,
+        }),
         join_type: JoinType::Right,
         on: Some(Expr::eq(Expr::col("users.id"), Expr::col("orders.user_id"))),
     };
@@ -700,9 +709,10 @@ fn right_join_null_padding() {
     assert_eq!(result.len(), 4);
 
     // Order 103 (user_id=9) should have NULL user columns.
-    let unmatched: Vec<_> = result.iter().filter(|r| {
-        r.get("orders.order_id") == Some(&Value::Int64(103))
-    }).collect();
+    let unmatched: Vec<_> = result
+        .iter()
+        .filter(|r| r.get("orders.order_id") == Some(&Value::Int64(103)))
+        .collect();
     assert_eq!(unmatched.len(), 1);
     assert_eq!(unmatched[0].get("users.id"), Some(&Value::Null));
 }
@@ -713,8 +723,12 @@ fn join_with_filter() {
     let orders_schema = make_orders_schema();
 
     let join_plan = LogicalPlan::Join {
-        left: Box::new(LogicalPlan::Scan { schema: users_schema }),
-        right: Box::new(LogicalPlan::Scan { schema: orders_schema }),
+        left: Box::new(LogicalPlan::Scan {
+            schema: users_schema,
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            schema: orders_schema,
+        }),
         join_type: JoinType::Inner,
         on: Some(Expr::eq(Expr::col("users.id"), Expr::col("orders.user_id"))),
     };
@@ -736,8 +750,12 @@ fn join_with_sort() {
     let orders_schema = make_orders_schema();
 
     let join_plan = LogicalPlan::Join {
-        left: Box::new(LogicalPlan::Scan { schema: users_schema }),
-        right: Box::new(LogicalPlan::Scan { schema: orders_schema }),
+        left: Box::new(LogicalPlan::Scan {
+            schema: users_schema,
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            schema: orders_schema,
+        }),
         join_type: JoinType::Inner,
         on: Some(Expr::eq(Expr::col("users.id"), Expr::col("orders.user_id"))),
     };
@@ -751,12 +769,13 @@ fn join_with_sort() {
     let result = execute_with_sources(&plan, &sources);
     assert_eq!(result.len(), 3);
 
-    let amounts: Vec<i64> = result.iter().filter_map(|r| {
-        match r.get("orders.amount") {
+    let amounts: Vec<i64> = result
+        .iter()
+        .filter_map(|r| match r.get("orders.amount") {
             Some(Value::Int64(n)) => Some(*n),
             _ => None,
-        }
-    }).collect();
+        })
+        .collect();
     assert_eq!(amounts, vec![70, 50, 30]);
 }
 
@@ -766,8 +785,12 @@ fn join_with_aggregate() {
     let orders_schema = make_orders_schema();
 
     let join_plan = LogicalPlan::Join {
-        left: Box::new(LogicalPlan::Scan { schema: users_schema }),
-        right: Box::new(LogicalPlan::Scan { schema: orders_schema }),
+        left: Box::new(LogicalPlan::Scan {
+            schema: users_schema,
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            schema: orders_schema,
+        }),
         join_type: JoinType::Inner,
         on: Some(Expr::eq(Expr::col("users.id"), Expr::col("orders.user_id"))),
     };
@@ -782,9 +805,10 @@ fn join_with_aggregate() {
     let result = execute_with_sources(&plan, &sources);
     assert_eq!(result.len(), 2); // Alice and Bob
 
-    let alice_row = result.iter().find(|r| {
-        r.get("users.name") == Some(&Value::Text("Alice".into()))
-    }).unwrap();
+    let alice_row = result
+        .iter()
+        .find(|r| r.get("users.name") == Some(&Value::Text("Alice".into())))
+        .unwrap();
     // Alice: orders 100 (50) + 102 (70) = 120
     assert_eq!(alice_row.get("total"), Some(&Value::Int64(120)));
 }
@@ -817,16 +841,25 @@ fn three_table_join() {
     // users JOIN orders ON users.id = orders.user_id
     // JOIN products ON orders.order_id = products.order_id
     let join1 = LogicalPlan::Join {
-        left: Box::new(LogicalPlan::Scan { schema: users_schema }),
-        right: Box::new(LogicalPlan::Scan { schema: orders_schema }),
+        left: Box::new(LogicalPlan::Scan {
+            schema: users_schema,
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            schema: orders_schema,
+        }),
         join_type: JoinType::Inner,
         on: Some(Expr::eq(Expr::col("users.id"), Expr::col("orders.user_id"))),
     };
     let plan = LogicalPlan::Join {
         left: Box::new(join1),
-        right: Box::new(LogicalPlan::Scan { schema: products_schema }),
+        right: Box::new(LogicalPlan::Scan {
+            schema: products_schema,
+        }),
         join_type: JoinType::Inner,
-        on: Some(Expr::eq(Expr::col("orders.order_id"), Expr::col("products.order_id"))),
+        on: Some(Expr::eq(
+            Expr::col("orders.order_id"),
+            Expr::col("products.order_id"),
+        )),
     };
 
     let mut sources = build_sources();
@@ -854,7 +887,8 @@ fn sql_parse_inner_join() {
     let plan = sql_to_plan_multi(
         "SELECT * FROM users JOIN orders ON users.id = orders.user_id",
         resolver,
-    ).expect("parse failed");
+    )
+    .expect("parse failed");
 
     let table_names = plan.collect_table_names();
     assert!(table_names.contains(&"users".into()));
@@ -878,7 +912,8 @@ fn sql_parse_left_join() {
     let plan = sql_to_plan_multi(
         "SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id",
         resolver,
-    ).expect("parse failed");
+    )
+    .expect("parse failed");
 
     let sources = build_sources();
     let result = execute_with_sources(&plan, &sources);
@@ -896,10 +931,8 @@ fn sql_parse_cross_join() {
         }
     };
 
-    let plan = sql_to_plan_multi(
-        "SELECT * FROM users CROSS JOIN orders",
-        resolver,
-    ).expect("parse failed");
+    let plan =
+        sql_to_plan_multi("SELECT * FROM users CROSS JOIN orders", resolver).expect("parse failed");
 
     let sources = build_sources();
     let result = execute_with_sources(&plan, &sources);
@@ -913,7 +946,9 @@ fn builder_join_api() {
 
     let plan = QueryBuilder::from(users_schema)
         .join(
-            LogicalPlan::Scan { schema: orders_schema },
+            LogicalPlan::Scan {
+                schema: orders_schema,
+            },
             Expr::eq(Expr::col("users.id"), Expr::col("orders.user_id")),
         )
         .build();
@@ -937,20 +972,28 @@ fn engine_join_integration() {
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).expect("open failed");
 
-    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT, age INT)").unwrap();
-    db.execute_sql("CREATE TABLE orders (order_id INT NOT NULL, user_id INT, amount INT)").unwrap();
+    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT, age INT)")
+        .unwrap();
+    db.execute_sql("CREATE TABLE orders (order_id INT NOT NULL, user_id INT, amount INT)")
+        .unwrap();
 
-    db.execute_sql("INSERT INTO users VALUES (1, 'Alice', 30)").unwrap();
-    db.execute_sql("INSERT INTO users VALUES (2, 'Bob', 25)").unwrap();
-    db.execute_sql("INSERT INTO users VALUES (3, 'Carol', 35)").unwrap();
+    db.execute_sql("INSERT INTO users VALUES (1, 'Alice', 30)")
+        .unwrap();
+    db.execute_sql("INSERT INTO users VALUES (2, 'Bob', 25)")
+        .unwrap();
+    db.execute_sql("INSERT INTO users VALUES (3, 'Carol', 35)")
+        .unwrap();
 
-    db.execute_sql("INSERT INTO orders VALUES (100, 1, 50)").unwrap();
-    db.execute_sql("INSERT INTO orders VALUES (101, 2, 30)").unwrap();
-    db.execute_sql("INSERT INTO orders VALUES (102, 1, 70)").unwrap();
+    db.execute_sql("INSERT INTO orders VALUES (100, 1, 50)")
+        .unwrap();
+    db.execute_sql("INSERT INTO orders VALUES (101, 2, 30)")
+        .unwrap();
+    db.execute_sql("INSERT INTO orders VALUES (102, 1, 70)")
+        .unwrap();
 
-    let result = db.execute_sql(
-        "SELECT * FROM users JOIN orders ON users.id = orders.user_id"
-    ).unwrap();
+    let result = db
+        .execute_sql("SELECT * FROM users JOIN orders ON users.id = orders.user_id")
+        .unwrap();
 
     match result {
         rust_dst_db::engine::SqlResult::Query { rows, columns, .. } => {
@@ -969,8 +1012,12 @@ fn join_empty_table() {
     let orders_schema = make_orders_schema();
 
     let plan = LogicalPlan::Join {
-        left: Box::new(LogicalPlan::Scan { schema: users_schema }),
-        right: Box::new(LogicalPlan::Scan { schema: orders_schema }),
+        left: Box::new(LogicalPlan::Scan {
+            schema: users_schema,
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            schema: orders_schema,
+        }),
         join_type: JoinType::Inner,
         on: Some(Expr::eq(Expr::col("users.id"), Expr::col("orders.user_id"))),
     };
@@ -984,8 +1031,12 @@ fn join_empty_table() {
 
     // Left join should preserve all left rows with NULL padding.
     let left_plan = LogicalPlan::Join {
-        left: Box::new(LogicalPlan::Scan { schema: make_schema() }),
-        right: Box::new(LogicalPlan::Scan { schema: make_orders_schema() }),
+        left: Box::new(LogicalPlan::Scan {
+            schema: make_schema(),
+        }),
+        right: Box::new(LogicalPlan::Scan {
+            schema: make_orders_schema(),
+        }),
         join_type: JoinType::Left,
         on: Some(Expr::eq(Expr::col("users.id"), Expr::col("orders.user_id"))),
     };
@@ -1013,7 +1064,7 @@ fn self_join() {
         join_type: JoinType::Inner,
         on: Some(Expr::and(
             Expr::eq(Expr::col("u1.active"), Expr::col("u2.active")),
-            Expr::lt(Expr::col("u1.id"), Expr::col("u2.id")),  // avoid duplicate pairs
+            Expr::lt(Expr::col("u1.id"), Expr::col("u2.id")), // avoid duplicate pairs
         )),
     };
 
@@ -1035,66 +1086,136 @@ fn self_join() {
 #[test]
 fn arithmetic_add_sub_mul_div() {
     let row = make_row(1, "Alice", 30, true);
-    assert_eq!(Expr::add(Expr::lit(10i64), Expr::lit(5i64)).eval(&row), Value::Int64(15));
-    assert_eq!(Expr::sub(Expr::lit(10i64), Expr::lit(3i64)).eval(&row), Value::Int64(7));
-    assert_eq!(Expr::mul(Expr::lit(4i64), Expr::lit(5i64)).eval(&row), Value::Int64(20));
-    assert_eq!(Expr::div(Expr::lit(20i64), Expr::lit(4i64)).eval(&row), Value::Int64(5));
-    assert_eq!(Expr::modulo(Expr::lit(10i64), Expr::lit(3i64)).eval(&row), Value::Int64(1));
+    assert_eq!(
+        Expr::add(Expr::lit(10i64), Expr::lit(5i64)).eval(&row),
+        Value::Int64(15)
+    );
+    assert_eq!(
+        Expr::sub(Expr::lit(10i64), Expr::lit(3i64)).eval(&row),
+        Value::Int64(7)
+    );
+    assert_eq!(
+        Expr::mul(Expr::lit(4i64), Expr::lit(5i64)).eval(&row),
+        Value::Int64(20)
+    );
+    assert_eq!(
+        Expr::div(Expr::lit(20i64), Expr::lit(4i64)).eval(&row),
+        Value::Int64(5)
+    );
+    assert_eq!(
+        Expr::modulo(Expr::lit(10i64), Expr::lit(3i64)).eval(&row),
+        Value::Int64(1)
+    );
 }
 
 #[test]
 fn arithmetic_div_by_zero_returns_null() {
     let row = make_row(1, "Alice", 30, true);
-    assert_eq!(Expr::div(Expr::lit(10i64), Expr::lit(0i64)).eval(&row), Value::Null);
-    assert_eq!(Expr::modulo(Expr::lit(10i64), Expr::lit(0i64)).eval(&row), Value::Null);
-    assert_eq!(Expr::div(Expr::lit(10.0f64), Expr::lit(0.0f64)).eval(&row), Value::Null);
+    assert_eq!(
+        Expr::div(Expr::lit(10i64), Expr::lit(0i64)).eval(&row),
+        Value::Null
+    );
+    assert_eq!(
+        Expr::modulo(Expr::lit(10i64), Expr::lit(0i64)).eval(&row),
+        Value::Null
+    );
+    assert_eq!(
+        Expr::div(Expr::lit(10.0f64), Expr::lit(0.0f64)).eval(&row),
+        Value::Null
+    );
 }
 
 #[test]
 fn arithmetic_int_float_promotion() {
     let row = make_row(1, "Alice", 30, true);
-    assert_eq!(Expr::add(Expr::lit(10i64), Expr::lit(2.5f64)).eval(&row), Value::Float64(12.5));
-    assert_eq!(Expr::mul(Expr::lit(3.0f64), Expr::lit(4i64)).eval(&row), Value::Float64(12.0));
+    assert_eq!(
+        Expr::add(Expr::lit(10i64), Expr::lit(2.5f64)).eval(&row),
+        Value::Float64(12.5)
+    );
+    assert_eq!(
+        Expr::mul(Expr::lit(3.0f64), Expr::lit(4i64)).eval(&row),
+        Value::Float64(12.0)
+    );
 }
 
 #[test]
 fn expr_is_null_is_not_null() {
     let mut row = make_row(1, "Alice", 30, true);
     row.insert("maybe".into(), Value::Null);
-    assert_eq!(Expr::is_null(Expr::col("maybe")).eval(&row), Value::Bool(true));
-    assert_eq!(Expr::is_not_null(Expr::col("maybe")).eval(&row), Value::Bool(false));
-    assert_eq!(Expr::is_null(Expr::col("name")).eval(&row), Value::Bool(false));
-    assert_eq!(Expr::is_not_null(Expr::col("name")).eval(&row), Value::Bool(true));
-    assert_eq!(Expr::is_null(Expr::col("nonexistent")).eval(&row), Value::Bool(true));
+    assert_eq!(
+        Expr::is_null(Expr::col("maybe")).eval(&row),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        Expr::is_not_null(Expr::col("maybe")).eval(&row),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        Expr::is_null(Expr::col("name")).eval(&row),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        Expr::is_not_null(Expr::col("name")).eval(&row),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        Expr::is_null(Expr::col("nonexistent")).eval(&row),
+        Value::Bool(true)
+    );
 }
 
 #[test]
 fn expr_like_wildcard_percent() {
     let row = make_row(1, "Alice", 30, true);
-    assert_eq!(Expr::like(Expr::col("name"), Expr::lit("A%")).eval(&row), Value::Bool(true));
-    assert_eq!(Expr::like(Expr::col("name"), Expr::lit("%ice")).eval(&row), Value::Bool(true));
-    assert_eq!(Expr::like(Expr::col("name"), Expr::lit("%li%")).eval(&row), Value::Bool(true));
+    assert_eq!(
+        Expr::like(Expr::col("name"), Expr::lit("A%")).eval(&row),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        Expr::like(Expr::col("name"), Expr::lit("%ice")).eval(&row),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        Expr::like(Expr::col("name"), Expr::lit("%li%")).eval(&row),
+        Value::Bool(true)
+    );
 }
 
 #[test]
 fn expr_like_wildcard_underscore() {
     let row = make_row(1, "Alice", 30, true);
-    assert_eq!(Expr::like(Expr::col("name"), Expr::lit("A_ice")).eval(&row), Value::Bool(true));
-    assert_eq!(Expr::like(Expr::col("name"), Expr::lit("_lice")).eval(&row), Value::Bool(true));
+    assert_eq!(
+        Expr::like(Expr::col("name"), Expr::lit("A_ice")).eval(&row),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        Expr::like(Expr::col("name"), Expr::lit("_lice")).eval(&row),
+        Value::Bool(true)
+    );
 }
 
 #[test]
 fn expr_like_no_match() {
     let row = make_row(1, "Alice", 30, true);
-    assert_eq!(Expr::like(Expr::col("name"), Expr::lit("Bob%")).eval(&row), Value::Bool(false));
-    assert_eq!(Expr::like(Expr::col("name"), Expr::lit("alice")).eval(&row), Value::Bool(false));
+    assert_eq!(
+        Expr::like(Expr::col("name"), Expr::lit("Bob%")).eval(&row),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        Expr::like(Expr::col("name"), Expr::lit("alice")).eval(&row),
+        Value::Bool(false)
+    );
 }
 
 #[test]
 fn expr_in_list() {
     let row = make_row(1, "Alice", 30, true);
     assert_eq!(
-        Expr::in_list(Expr::col("name"), vec![Expr::lit("Alice"), Expr::lit("Bob"), Expr::lit("Carol")]).eval(&row),
+        Expr::in_list(
+            Expr::col("name"),
+            vec![Expr::lit("Alice"), Expr::lit("Bob"), Expr::lit("Carol")]
+        )
+        .eval(&row),
         Value::Bool(true)
     );
 }
@@ -1103,7 +1224,11 @@ fn expr_in_list() {
 fn expr_in_list_no_match() {
     let row = make_row(1, "Alice", 30, true);
     assert_eq!(
-        Expr::in_list(Expr::col("name"), vec![Expr::lit("Bob"), Expr::lit("Carol"), Expr::lit("Dave")]).eval(&row),
+        Expr::in_list(
+            Expr::col("name"),
+            vec![Expr::lit("Bob"), Expr::lit("Carol"), Expr::lit("Dave")]
+        )
+        .eval(&row),
         Value::Bool(false)
     );
 }
@@ -1111,9 +1236,18 @@ fn expr_in_list_no_match() {
 #[test]
 fn expr_between() {
     let row = make_row(1, "Alice", 30, true);
-    assert_eq!(Expr::between(Expr::col("age"), Expr::lit(25i64), Expr::lit(35i64)).eval(&row), Value::Bool(true));
-    assert_eq!(Expr::between(Expr::col("age"), Expr::lit(31i64), Expr::lit(40i64)).eval(&row), Value::Bool(false));
-    assert_eq!(Expr::between(Expr::col("age"), Expr::lit(30i64), Expr::lit(40i64)).eval(&row), Value::Bool(true));
+    assert_eq!(
+        Expr::between(Expr::col("age"), Expr::lit(25i64), Expr::lit(35i64)).eval(&row),
+        Value::Bool(true)
+    );
+    assert_eq!(
+        Expr::between(Expr::col("age"), Expr::lit(31i64), Expr::lit(40i64)).eval(&row),
+        Value::Bool(false)
+    );
+    assert_eq!(
+        Expr::between(Expr::col("age"), Expr::lit(30i64), Expr::lit(40i64)).eval(&row),
+        Value::Bool(true)
+    );
 }
 
 #[test]
@@ -1121,7 +1255,10 @@ fn expr_case_simple() {
     let row = make_row(1, "Alice", 30, true);
     let case_expr = Expr::case(
         Some(Expr::col("name")),
-        vec![(Expr::lit("Alice"), Expr::lit("found")), (Expr::lit("Bob"), Expr::lit("other"))],
+        vec![
+            (Expr::lit("Alice"), Expr::lit("found")),
+            (Expr::lit("Bob"), Expr::lit("other")),
+        ],
         Some(Expr::lit("unknown")),
     );
     assert_eq!(case_expr.eval(&row), Value::Text("found".into()));
@@ -1133,8 +1270,14 @@ fn expr_case_searched() {
     let case_expr = Expr::case(
         None,
         vec![
-            (Expr::gt(Expr::col("age"), Expr::lit(40i64)), Expr::lit("old")),
-            (Expr::gt(Expr::col("age"), Expr::lit(25i64)), Expr::lit("mid")),
+            (
+                Expr::gt(Expr::col("age"), Expr::lit(40i64)),
+                Expr::lit("old"),
+            ),
+            (
+                Expr::gt(Expr::col("age"), Expr::lit(25i64)),
+                Expr::lit("mid"),
+            ),
         ],
         Some(Expr::lit("young")),
     );
@@ -1145,7 +1288,10 @@ fn expr_case_searched() {
 fn expr_negate() {
     let row = make_row(1, "Alice", 30, true);
     assert_eq!(Expr::negate(Expr::lit(42i64)).eval(&row), Value::Int64(-42));
-    assert_eq!(Expr::negate(Expr::lit(3.14f64)).eval(&row), Value::Float64(-3.14));
+    assert_eq!(
+        Expr::negate(Expr::lit(3.14f64)).eval(&row),
+        Value::Float64(-3.14)
+    );
     assert_eq!(Expr::negate(Expr::lit("text")).eval(&row), Value::Null);
 }
 
@@ -1159,10 +1305,13 @@ fn sql_arithmetic_in_select() {
 
 #[test]
 fn sql_is_null() {
-    let schema = Schema::new("items", vec![
-        Column::new("id", ValueType::Int64).not_null(),
-        Column::new("val", ValueType::Text),
-    ]);
+    let schema = Schema::new(
+        "items",
+        vec![
+            Column::new("id", ValueType::Int64).not_null(),
+            Column::new("val", ValueType::Text),
+        ],
+    );
     let mut r1 = BTreeMap::new();
     r1.insert("id".into(), Value::Int64(1));
     r1.insert("val".into(), Value::Text("hello".into()));
@@ -1179,7 +1328,8 @@ fn sql_is_null() {
 #[test]
 fn sql_like() {
     let schema = make_schema();
-    let plan = sql_to_plan("SELECT * FROM users WHERE name LIKE 'A%'", schema).expect("parse failed");
+    let plan =
+        sql_to_plan("SELECT * FROM users WHERE name LIKE 'A%'", schema).expect("parse failed");
     let result = execute(&plan, sample_rows());
     assert_eq!(result.len(), 1);
     assert_eq!(result[0]["name"], Value::Text("Alice".into()));
@@ -1188,7 +1338,11 @@ fn sql_like() {
 #[test]
 fn sql_in_list_test() {
     let schema = make_schema();
-    let plan = sql_to_plan("SELECT * FROM users WHERE name IN ('Alice', 'Carol')", schema).expect("parse failed");
+    let plan = sql_to_plan(
+        "SELECT * FROM users WHERE name IN ('Alice', 'Carol')",
+        schema,
+    )
+    .expect("parse failed");
     let result = execute(&plan, sample_rows());
     assert_eq!(result.len(), 2);
 }
@@ -1196,7 +1350,8 @@ fn sql_in_list_test() {
 #[test]
 fn sql_between() {
     let schema = make_schema();
-    let plan = sql_to_plan("SELECT * FROM users WHERE age BETWEEN 25 AND 30", schema).expect("parse failed");
+    let plan = sql_to_plan("SELECT * FROM users WHERE age BETWEEN 25 AND 30", schema)
+        .expect("parse failed");
     let result = execute(&plan, sample_rows());
     assert_eq!(result.len(), 3);
 }
@@ -1215,7 +1370,8 @@ fn sql_having() {
     let plan = sql_to_plan(
         "SELECT active, COUNT(*) AS cnt FROM users GROUP BY active HAVING cnt > 2",
         schema,
-    ).expect("parse failed");
+    )
+    .expect("parse failed");
     let result = execute(&plan, sample_rows());
     assert_eq!(result.len(), 1);
     assert_eq!(result[0]["active"], Value::Bool(true));
@@ -1228,7 +1384,8 @@ fn sql_offset() {
     let plan = sql_to_plan(
         "SELECT * FROM users ORDER BY age ASC LIMIT 3 OFFSET 2",
         schema,
-    ).expect("parse failed");
+    )
+    .expect("parse failed");
     let result = execute(&plan, sample_rows());
     assert_eq!(result.len(), 1);
     assert_eq!(result[0]["age"], Value::Int64(28));
@@ -1239,8 +1396,8 @@ fn sql_offset() {
 // ═══════════════════════════════════════════════════════════════════════
 
 use rust_dst_db::query::expr::{
-    parse_timestamp_str, parse_date_str, parse_uuid_str, parse_decimal_str,
-    format_timestamp, format_date, format_uuid, format_decimal, ymd_to_days,
+    format_date, format_decimal, format_timestamp, format_uuid, parse_date_str, parse_decimal_str,
+    parse_timestamp_str, parse_uuid_str, ymd_to_days,
 };
 
 #[test]
@@ -1394,8 +1551,10 @@ fn engine_insert_select_timestamp() {
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).expect("open failed");
 
-    db.execute_sql("CREATE TABLE logs (id INT NOT NULL, ts TIMESTAMP)").unwrap();
-    db.execute_sql("INSERT INTO logs VALUES (1, TIMESTAMP '2024-01-15 10:30:00')").unwrap();
+    db.execute_sql("CREATE TABLE logs (id INT NOT NULL, ts TIMESTAMP)")
+        .unwrap();
+    db.execute_sql("INSERT INTO logs VALUES (1, TIMESTAMP '2024-01-15 10:30:00')")
+        .unwrap();
 
     let result = db.execute_sql("SELECT * FROM logs").unwrap();
     match result {
@@ -1421,8 +1580,10 @@ fn engine_insert_select_date() {
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).expect("open failed");
 
-    db.execute_sql("CREATE TABLE events (id INT NOT NULL, event_date DATE)").unwrap();
-    db.execute_sql("INSERT INTO events VALUES (1, DATE '2024-06-15')").unwrap();
+    db.execute_sql("CREATE TABLE events (id INT NOT NULL, event_date DATE)")
+        .unwrap();
+    db.execute_sql("INSERT INTO events VALUES (1, DATE '2024-06-15')")
+        .unwrap();
 
     let result = db.execute_sql("SELECT * FROM events").unwrap();
     match result {
@@ -1447,8 +1608,12 @@ fn engine_insert_select_uuid() {
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).expect("open failed");
 
-    db.execute_sql("CREATE TABLE items (id UUID NOT NULL, name TEXT)").unwrap();
-    db.execute_sql("INSERT INTO items VALUES (CAST('550e8400-e29b-41d4-a716-446655440000' AS UUID), 'widget')").unwrap();
+    db.execute_sql("CREATE TABLE items (id UUID NOT NULL, name TEXT)")
+        .unwrap();
+    db.execute_sql(
+        "INSERT INTO items VALUES (CAST('550e8400-e29b-41d4-a716-446655440000' AS UUID), 'widget')",
+    )
+    .unwrap();
 
     let result = db.execute_sql("SELECT * FROM items").unwrap();
     match result {
@@ -1473,9 +1638,11 @@ fn engine_insert_select_decimal() {
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).expect("open failed");
 
-    db.execute_sql("CREATE TABLE prices (id INT NOT NULL, amount DECIMAL)").unwrap();
+    db.execute_sql("CREATE TABLE prices (id INT NOT NULL, amount DECIMAL)")
+        .unwrap();
     // Insert using a regular numeric literal -- sqlparser parses 99.95 as a Number
-    db.execute_sql("INSERT INTO prices VALUES (1, 99.95)").unwrap();
+    db.execute_sql("INSERT INTO prices VALUES (1, 99.95)")
+        .unwrap();
 
     let result = db.execute_sql("SELECT * FROM prices").unwrap();
     match result {
@@ -1514,7 +1681,10 @@ fn expr_coalesce_returns_first_non_null() {
 #[test]
 fn expr_coalesce_all_null() {
     let row = make_row(1, "Alice", 30, true);
-    let expr = Expr::function("COALESCE", vec![Expr::lit(Value::Null), Expr::lit(Value::Null)]);
+    let expr = Expr::function(
+        "COALESCE",
+        vec![Expr::lit(Value::Null), Expr::lit(Value::Null)],
+    );
     assert_eq!(expr.eval(&row), Value::Null);
 }
 
@@ -1555,8 +1725,10 @@ fn engine_now_in_insert() {
     let dir = std::env::temp_dir().join("rust_db_test_now_insert");
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).unwrap();
-    db.execute_sql("CREATE TABLE events (id INT NOT NULL, ts TIMESTAMP)").unwrap();
-    db.execute_sql("INSERT INTO events VALUES (1, NOW())").unwrap();
+    db.execute_sql("CREATE TABLE events (id INT NOT NULL, ts TIMESTAMP)")
+        .unwrap();
+    db.execute_sql("INSERT INTO events VALUES (1, NOW())")
+        .unwrap();
     match db.execute_sql("SELECT * FROM events WHERE id = 1").unwrap() {
         rust_dst_db::engine::SqlResult::Query { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -1575,9 +1747,12 @@ fn engine_coalesce_in_update() {
     let dir = std::env::temp_dir().join("rust_db_test_coalesce_update");
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).unwrap();
-    db.execute_sql("CREATE TABLE items (id INT NOT NULL, name TEXT)").unwrap();
-    db.execute_sql("INSERT INTO items VALUES (1, 'original')").unwrap();
-    db.execute_sql("UPDATE items SET name = COALESCE(NULL, 'fallback') WHERE id = 1").unwrap();
+    db.execute_sql("CREATE TABLE items (id INT NOT NULL, name TEXT)")
+        .unwrap();
+    db.execute_sql("INSERT INTO items VALUES (1, 'original')")
+        .unwrap();
+    db.execute_sql("UPDATE items SET name = COALESCE(NULL, 'fallback') WHERE id = 1")
+        .unwrap();
     match db.execute_sql("SELECT * FROM items WHERE id = 1").unwrap() {
         rust_dst_db::engine::SqlResult::Query { rows, .. } => {
             assert_eq!(rows[0].get("name"), Some(&Value::Text("fallback".into())));
@@ -1596,8 +1771,11 @@ fn engine_insert_returning_star() {
     let dir = std::env::temp_dir().join("rust_db_test_insert_returning_star");
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).unwrap();
-    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)").unwrap();
-    let result = db.execute_sql("INSERT INTO users VALUES (1, 'Alice') RETURNING *").unwrap();
+    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)")
+        .unwrap();
+    let result = db
+        .execute_sql("INSERT INTO users VALUES (1, 'Alice') RETURNING *")
+        .unwrap();
     match result {
         rust_dst_db::engine::SqlResult::Query { rows, columns, .. } => {
             assert_eq!(rows.len(), 1);
@@ -1616,8 +1794,11 @@ fn engine_insert_returning_columns() {
     let dir = std::env::temp_dir().join("rust_db_test_insert_returning_cols");
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).unwrap();
-    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT, age INT)").unwrap();
-    let result = db.execute_sql("INSERT INTO users VALUES (1, 'Alice', 30) RETURNING id, name").unwrap();
+    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT, age INT)")
+        .unwrap();
+    let result = db
+        .execute_sql("INSERT INTO users VALUES (1, 'Alice', 30) RETURNING id, name")
+        .unwrap();
     match result {
         rust_dst_db::engine::SqlResult::Query { rows, columns, .. } => {
             assert_eq!(rows.len(), 1);
@@ -1635,9 +1816,13 @@ fn engine_update_returning() {
     let dir = std::env::temp_dir().join("rust_db_test_update_returning");
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).unwrap();
-    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)").unwrap();
-    db.execute_sql("INSERT INTO users VALUES (1, 'Alice')").unwrap();
-    let result = db.execute_sql("UPDATE users SET name = 'Bob' WHERE id = 1 RETURNING *").unwrap();
+    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)")
+        .unwrap();
+    db.execute_sql("INSERT INTO users VALUES (1, 'Alice')")
+        .unwrap();
+    let result = db
+        .execute_sql("UPDATE users SET name = 'Bob' WHERE id = 1 RETURNING *")
+        .unwrap();
     match result {
         rust_dst_db::engine::SqlResult::Query { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -1653,10 +1838,15 @@ fn engine_delete_returning() {
     let dir = std::env::temp_dir().join("rust_db_test_delete_returning");
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).unwrap();
-    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)").unwrap();
-    db.execute_sql("INSERT INTO users VALUES (1, 'Alice')").unwrap();
-    db.execute_sql("INSERT INTO users VALUES (2, 'Bob')").unwrap();
-    let result = db.execute_sql("DELETE FROM users WHERE id = 1 RETURNING *").unwrap();
+    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)")
+        .unwrap();
+    db.execute_sql("INSERT INTO users VALUES (1, 'Alice')")
+        .unwrap();
+    db.execute_sql("INSERT INTO users VALUES (2, 'Bob')")
+        .unwrap();
+    let result = db
+        .execute_sql("DELETE FROM users WHERE id = 1 RETURNING *")
+        .unwrap();
     match result {
         rust_dst_db::engine::SqlResult::Query { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -1676,10 +1866,13 @@ fn engine_on_conflict_do_nothing() {
     let dir = std::env::temp_dir().join("rust_db_test_on_conflict_nothing");
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).unwrap();
-    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)").unwrap();
-    db.execute_sql("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)")
+        .unwrap();
+    db.execute_sql("INSERT INTO users VALUES (1, 'Alice')")
+        .unwrap();
     // Insert with same PK, should be ignored
-    db.execute_sql("INSERT INTO users VALUES (1, 'Bob') ON CONFLICT DO NOTHING").unwrap();
+    db.execute_sql("INSERT INTO users VALUES (1, 'Bob') ON CONFLICT DO NOTHING")
+        .unwrap();
     match db.execute_sql("SELECT * FROM users WHERE id = 1").unwrap() {
         rust_dst_db::engine::SqlResult::Query { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -1695,10 +1888,18 @@ fn engine_on_conflict_do_update() {
     let dir = std::env::temp_dir().join("rust_db_test_on_conflict_update");
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).unwrap();
-    db.execute_sql("CREATE TABLE counters (id INT NOT NULL, count INT)").unwrap();
-    db.execute_sql("INSERT INTO counters VALUES (1, 10)").unwrap();
-    db.execute_sql("INSERT INTO counters VALUES (1, 20) ON CONFLICT (id) DO UPDATE SET count = EXCLUDED.count").unwrap();
-    match db.execute_sql("SELECT * FROM counters WHERE id = 1").unwrap() {
+    db.execute_sql("CREATE TABLE counters (id INT NOT NULL, count INT)")
+        .unwrap();
+    db.execute_sql("INSERT INTO counters VALUES (1, 10)")
+        .unwrap();
+    db.execute_sql(
+        "INSERT INTO counters VALUES (1, 20) ON CONFLICT (id) DO UPDATE SET count = EXCLUDED.count",
+    )
+    .unwrap();
+    match db
+        .execute_sql("SELECT * FROM counters WHERE id = 1")
+        .unwrap()
+    {
         rust_dst_db::engine::SqlResult::Query { rows, .. } => {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get("count"), Some(&Value::Int64(20)));
@@ -1713,9 +1914,11 @@ fn engine_on_conflict_do_nothing_no_conflict() {
     let dir = std::env::temp_dir().join("rust_db_test_on_conflict_no_conflict");
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).unwrap();
-    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)").unwrap();
+    db.execute_sql("CREATE TABLE users (id INT NOT NULL, name TEXT)")
+        .unwrap();
     // No existing row, should insert normally
-    db.execute_sql("INSERT INTO users VALUES (1, 'Alice') ON CONFLICT DO NOTHING").unwrap();
+    db.execute_sql("INSERT INTO users VALUES (1, 'Alice') ON CONFLICT DO NOTHING")
+        .unwrap();
     match db.execute_sql("SELECT * FROM users").unwrap() {
         rust_dst_db::engine::SqlResult::Query { rows, .. } => {
             assert_eq!(rows.len(), 1);
@@ -1731,8 +1934,10 @@ fn engine_insert_returning_with_on_conflict() {
     let dir = std::env::temp_dir().join("rust_db_test_returning_on_conflict");
     let _ = std::fs::remove_dir_all(&dir);
     let db = rust_dst_db::engine::Database::open(&dir).unwrap();
-    db.execute_sql("CREATE TABLE items (id INT NOT NULL, name TEXT)").unwrap();
-    db.execute_sql("INSERT INTO items VALUES (1, 'old')").unwrap();
+    db.execute_sql("CREATE TABLE items (id INT NOT NULL, name TEXT)")
+        .unwrap();
+    db.execute_sql("INSERT INTO items VALUES (1, 'old')")
+        .unwrap();
     let result = db.execute_sql(
         "INSERT INTO items VALUES (1, 'new') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name RETURNING *"
     ).unwrap();

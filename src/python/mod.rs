@@ -5,7 +5,7 @@ pub mod types;
 
 use pyo3::prelude::*;
 
-use crate::python::query::{py_execute, py_sql_to_plan, PyPlan, PyQueryBuilder};
+use crate::python::query::{PyPlan, PyQueryBuilder, py_execute, py_sql_to_plan};
 use crate::python::types::{PyColumn, PyExpr, PySchema, PyValue};
 
 #[pymodule]

@@ -52,10 +52,11 @@ impl WalReader {
             let payload_len = u32::from_le_bytes(len_bytes) as usize;
 
             // Read CRC32.
-            let crc_bytes: [u8; 4] = match data.get(pos + 4..pos + 8).and_then(|s| s.try_into().ok()) {
-                Some(b) => b,
-                None => break, // Truncated header — stop.
-            };
+            let crc_bytes: [u8; 4] =
+                match data.get(pos + 4..pos + 8).and_then(|s| s.try_into().ok()) {
+                    Some(b) => b,
+                    None => break, // Truncated header — stop.
+                };
             let stored_crc = u32::from_le_bytes(crc_bytes);
 
             // Bounds check.

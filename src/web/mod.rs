@@ -3,11 +3,13 @@
 //! Provides JSON endpoints for authentication, table browsing, SQL execution,
 //! and user management. Serves an embedded SPA frontend.
 
+pub mod metrics;
+
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -17,6 +19,8 @@ use tower_http::cors::{Any, CorsLayer};
 use crate::auth::AuthManager;
 use crate::engine::Database;
 use crate::query::expr::Value;
+
+use self::metrics::Metrics;
 
 // ---------------------------------------------------------------------------
 // Static frontend files (embedded at compile time)
@@ -35,6 +39,7 @@ pub struct AppState {
     pub db: Database,
     pub auth: Option<Arc<Mutex<AuthManager>>>,
     pub sessions: Arc<Mutex<BTreeMap<String, Session>>>,
+    pub metrics: Metrics,
 }
 
 pub struct Session {
@@ -164,6 +169,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/users", get(list_users))
         .route("/api/users", post(create_user))
         .route("/api/users/{name}", delete(delete_user))
+        // Operational endpoints (unauthenticated by design — scraped by Prom / LBs)
+        .route("/metrics", get(serve_metrics))
+        .route("/health", get(serve_health))
         // Permissive CORS: API is intended to be reached from the Tauri
         // desktop client (origin `tauri://localhost` / `http://tauri.localhost`)
         // as well as the embedded browser UI. Bearer tokens travel in headers,
@@ -194,7 +202,13 @@ fn extract_session(headers: &HeaderMap, state: &AppState) -> Option<String> {
 
 fn require_auth(headers: &HeaderMap, state: &AppState) -> Result<String, Response> {
     extract_session(headers, state).ok_or_else(|| {
-        (StatusCode::UNAUTHORIZED, Json(ErrorBody { error: "unauthorized".into() })).into_response()
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "unauthorized".into(),
+            }),
+        )
+            .into_response()
     })
 }
 
@@ -205,11 +219,19 @@ fn value_to_json(v: &Value) -> serde_json::Value {
         Value::Int64(n) => serde_json::json!(*n),
         Value::Float64(f) => serde_json::json!(*f),
         Value::Text(s) => serde_json::Value::String(s.clone()),
-        Value::Bytes(b) => serde_json::Value::String(format!("\\x{}", b.iter().map(|b| format!("{:02x}", b)).collect::<String>())),
-        Value::Timestamp(us) => serde_json::Value::String(crate::query::expr::format_timestamp(*us)),
+        Value::Bytes(b) => serde_json::Value::String(format!(
+            "\\x{}",
+            b.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+        )),
+        Value::Timestamp(us) => {
+            serde_json::Value::String(crate::query::expr::format_timestamp(*us))
+        }
         Value::Date(days) => serde_json::Value::String(crate::query::expr::format_date(*days)),
         Value::Uuid(bytes) => serde_json::Value::String(crate::query::expr::format_uuid(bytes)),
-        Value::Decimal(val, scale) => serde_json::Value::String(crate::query::expr::format_decimal(*val, *scale)),
+        Value::Decimal(val, scale) => {
+            serde_json::Value::String(crate::query::expr::format_decimal(*val, *scale))
+        }
+        Value::Vector(v) => serde_json::Value::String(crate::query::expr::format_vector(v)),
     }
 }
 
@@ -226,6 +248,7 @@ fn value_type_name(vt: &crate::query::expr::ValueType) -> &'static str {
         ValueType::Date => "date",
         ValueType::Uuid => "uuid",
         ValueType::Decimal => "decimal",
+        ValueType::Vector { .. } => "vector",
     }
 }
 
@@ -238,11 +261,7 @@ async fn serve_index() -> Html<&'static str> {
 }
 
 async fn serve_css() -> Response {
-    (
-        StatusCode::OK,
-        [("content-type", "text/css")],
-        STYLE_CSS,
-    ).into_response()
+    (StatusCode::OK, [("content-type", "text/css")], STYLE_CSS).into_response()
 }
 
 async fn serve_js() -> Response {
@@ -250,7 +269,45 @@ async fn serve_js() -> Response {
         StatusCode::OK,
         [("content-type", "application/javascript")],
         APP_JS,
-    ).into_response()
+    )
+        .into_response()
+}
+
+async fn serve_metrics(State(state): State<AppState>) -> Response {
+    // Refresh the checkpoint counter from the engine so auto-checkpoints
+    // (which fire inside commit()) are visible via the Prometheus counter.
+    if let Ok(engine_checkpoints) = state.db.checkpoint_count() {
+        state.metrics.set_checkpoint_count(engine_checkpoints);
+    }
+    let body = state.metrics.render_prometheus();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        body,
+    )
+        .into_response()
+}
+
+async fn serve_health(State(state): State<AppState>) -> Response {
+    // Cheap liveness probe: try listing tables. If the lock is reachable
+    // and the catalog is readable, the engine is alive.
+    match state.db.table_count() {
+        Ok(n) => {
+            let body = serde_json::json!({
+                "status": "ok",
+                "tables": n,
+                "active_connections": state.metrics.active_connections(),
+            });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(e) => {
+            let body = serde_json::json!({
+                "status": "unavailable",
+                "error": e.to_string(),
+            });
+            (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,21 +319,36 @@ async fn auth_status(State(state): State<AppState>) -> Response {
     struct StatusResp {
         auth_enabled: bool,
     }
-    (StatusCode::OK, Json(StatusResp { auth_enabled: state.auth.is_some() })).into_response()
+    (
+        StatusCode::OK,
+        Json(StatusResp {
+            auth_enabled: state.auth.is_some(),
+        }),
+    )
+        .into_response()
 }
 
-async fn login(
-    State(state): State<AppState>,
-    Json(req): Json<LoginRequest>,
-) -> Response {
+async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
     let auth = match &state.auth {
         Some(a) => a,
         None => {
             // Auth disabled — auto-login
             let token = uuid::Uuid::new_v4().to_string();
             let mut sessions = state.sessions.lock().unwrap();
-            sessions.insert(token.clone(), Session { username: "anonymous".into() });
-            return (StatusCode::OK, Json(LoginResponse { token, username: "anonymous".into() })).into_response();
+            sessions.insert(
+                token.clone(),
+                Session {
+                    username: "anonymous".into(),
+                },
+            );
+            return (
+                StatusCode::OK,
+                Json(LoginResponse {
+                    token,
+                    username: "anonymous".into(),
+                }),
+            )
+                .into_response();
         }
     };
 
@@ -285,41 +357,77 @@ async fn login(
         drop(auth_guard);
         let token = uuid::Uuid::new_v4().to_string();
         let mut sessions = state.sessions.lock().unwrap();
-        sessions.insert(token.clone(), Session { username: req.username.clone() });
-        (StatusCode::OK, Json(LoginResponse { token, username: req.username })).into_response()
+        sessions.insert(
+            token.clone(),
+            Session {
+                username: req.username.clone(),
+            },
+        );
+        (
+            StatusCode::OK,
+            Json(LoginResponse {
+                token,
+                username: req.username,
+            }),
+        )
+            .into_response()
     } else {
-        (StatusCode::UNAUTHORIZED, Json(ErrorBody { error: "invalid credentials".into() })).into_response()
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorBody {
+                error: "invalid credentials".into(),
+            }),
+        )
+            .into_response()
     }
 }
 
-async fn register(
-    State(state): State<AppState>,
-    Json(req): Json<LoginRequest>,
-) -> Response {
+async fn register(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
     let auth = match &state.auth {
         Some(a) => a,
         None => {
-            return (StatusCode::BAD_REQUEST, Json(ErrorBody { error: "authentication not enabled".into() })).into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorBody {
+                    error: "authentication not enabled".into(),
+                }),
+            )
+                .into_response();
         }
     };
 
     let mut guard = auth.lock().unwrap();
     if guard.user_exists(&req.username) {
-        return (StatusCode::CONFLICT, Json(ErrorBody { error: "username already taken".into() })).into_response();
+        return (
+            StatusCode::CONFLICT,
+            Json(ErrorBody {
+                error: "username already taken".into(),
+            }),
+        )
+            .into_response();
     }
     guard.add_user(&req.username, &req.password);
     drop(guard);
 
     let token = uuid::Uuid::new_v4().to_string();
     let mut sessions = state.sessions.lock().unwrap();
-    sessions.insert(token.clone(), Session { username: req.username.clone() });
-    (StatusCode::CREATED, Json(LoginResponse { token, username: req.username })).into_response()
+    sessions.insert(
+        token.clone(),
+        Session {
+            username: req.username.clone(),
+        },
+    );
+    (
+        StatusCode::CREATED,
+        Json(LoginResponse {
+            token,
+            username: req.username,
+        }),
+    )
+        .into_response()
 }
 
-async fn logout(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Some(auth_header) = headers.get("authorization").and_then(|h| h.to_str().ok()) {
         if let Some(token) = auth_header.strip_prefix("Bearer ") {
             let mut sessions = state.sessions.lock().unwrap();
@@ -329,18 +437,17 @@ async fn logout(
     StatusCode::OK.into_response()
 }
 
-async fn me(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
     match require_auth(&headers, &state) {
         Err(r) => r,
-        Ok(username) => {
-            (StatusCode::OK, Json(MeResponse {
+        Ok(username) => (
+            StatusCode::OK,
+            Json(MeResponse {
                 username,
                 auth_enabled: state.auth.is_some(),
-            })).into_response()
-        }
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -348,42 +455,55 @@ async fn me(
 // Table endpoints
 // ---------------------------------------------------------------------------
 
-async fn list_tables(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(r) = require_auth(&headers, &state) { return r; }
+async fn list_tables(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_auth(&headers, &state) {
+        return r;
+    }
 
     match state.db.list_tables() {
         Ok(schemas) => {
-            let tables: Vec<TableInfo> = schemas.iter().map(|s| {
-                let row_count = state.db.execute_sql(&format!("SELECT COUNT(*) AS c FROM {}", s.table))
-                    .ok()
-                    .and_then(|r| match r {
-                        crate::engine::SqlResult::Query { rows, .. } => {
-                            rows.first().and_then(|row| row.get("c")).and_then(|v| match v {
-                                Value::Int64(n) => Some(*n as usize),
-                                _ => None,
+            let tables: Vec<TableInfo> = schemas
+                .iter()
+                .map(|s| {
+                    let row_count = state
+                        .db
+                        .execute_sql(&format!("SELECT COUNT(*) AS c FROM {}", s.table))
+                        .ok()
+                        .and_then(|r| match r {
+                            crate::engine::SqlResult::Query { rows, .. } => rows
+                                .first()
+                                .and_then(|row| row.get("c"))
+                                .and_then(|v| match v {
+                                    Value::Int64(n) => Some(*n as usize),
+                                    _ => None,
+                                }),
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    TableInfo {
+                        name: s.table.clone(),
+                        columns: s
+                            .columns
+                            .iter()
+                            .map(|c| ColumnInfo {
+                                name: c.name.clone(),
+                                col_type: format!("{:?}", c.col_type),
+                                nullable: c.nullable,
                             })
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                TableInfo {
-                    name: s.table.clone(),
-                    columns: s.columns.iter().map(|c| ColumnInfo {
-                        name: c.name.clone(),
-                        col_type: format!("{:?}", c.col_type),
-                        nullable: c.nullable,
-                    }).collect(),
-                    row_count,
-                }
-            }).collect();
+                            .collect(),
+                        row_count,
+                    }
+                })
+                .collect();
             (StatusCode::OK, Json(tables)).into_response()
         }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { error: e.to_string() })).into_response()
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -392,40 +512,68 @@ async fn get_table(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if let Err(r) = require_auth(&headers, &state) { return r; }
+    if let Err(r) = require_auth(&headers, &state) {
+        return r;
+    }
 
     let schema = match state.db.get_schema(&name) {
         Ok(Some(s)) => s,
-        Ok(None) => return (StatusCode::NOT_FOUND, Json(ErrorBody { error: format!("table '{}' not found", name) })).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { error: e.to_string() })).into_response(),
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ErrorBody {
+                    error: format!("table '{}' not found", name),
+                }),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorBody {
+                    error: e.to_string(),
+                }),
+            )
+                .into_response();
+        }
     };
 
     let indexes = state.db.list_indexes(&name).unwrap_or_default();
-    let row_count = state.db.execute_sql(&format!("SELECT COUNT(*) AS c FROM {}", name))
+    let row_count = state
+        .db
+        .execute_sql(&format!("SELECT COUNT(*) AS c FROM {}", name))
         .ok()
         .and_then(|r| match r {
-            crate::engine::SqlResult::Query { rows, .. } => {
-                rows.first().and_then(|row| row.get("c")).and_then(|v| match v {
+            crate::engine::SqlResult::Query { rows, .. } => rows
+                .first()
+                .and_then(|row| row.get("c"))
+                .and_then(|v| match v {
                     Value::Int64(n) => Some(*n as usize),
                     _ => None,
-                })
-            }
+                }),
             _ => None,
         })
         .unwrap_or(0);
 
     let detail = TableDetail {
         name: schema.table.clone(),
-        columns: schema.columns.iter().map(|c| ColumnInfo {
-            name: c.name.clone(),
-            col_type: format!("{:?}", c.col_type),
-            nullable: c.nullable,
-        }).collect(),
-        indexes: indexes.iter().map(|idx| IndexInfo {
-            name: idx.name.clone(),
-            columns: idx.columns.clone(),
-            unique: idx.unique,
-        }).collect(),
+        columns: schema
+            .columns
+            .iter()
+            .map(|c| ColumnInfo {
+                name: c.name.clone(),
+                col_type: format!("{:?}", c.col_type),
+                nullable: c.nullable,
+            })
+            .collect(),
+        indexes: indexes
+            .iter()
+            .map(|idx| IndexInfo {
+                name: idx.name.clone(),
+                columns: idx.columns.clone(),
+                unique: idx.unique,
+            })
+            .collect(),
         row_count,
     };
 
@@ -438,46 +586,77 @@ async fn get_table_data(
     Path(name): Path<String>,
     Query(params): Query<PaginationParams>,
 ) -> Response {
-    if let Err(r) = require_auth(&headers, &state) { return r; }
+    if let Err(r) = require_auth(&headers, &state) {
+        return r;
+    }
 
     let limit = params.limit.unwrap_or(100).min(1000);
     let offset = params.offset.unwrap_or(0);
 
     // Get total count
-    let total = state.db.execute_sql(&format!("SELECT COUNT(*) AS c FROM {}", name))
+    let total = state
+        .db
+        .execute_sql(&format!("SELECT COUNT(*) AS c FROM {}", name))
         .ok()
         .and_then(|r| match r {
-            crate::engine::SqlResult::Query { rows, .. } => {
-                rows.first().and_then(|row| row.get("c")).and_then(|v| match v {
+            crate::engine::SqlResult::Query { rows, .. } => rows
+                .first()
+                .and_then(|row| row.get("c"))
+                .and_then(|v| match v {
                     Value::Int64(n) => Some(*n as usize),
                     _ => None,
-                })
-            }
+                }),
             _ => None,
         })
         .unwrap_or(0);
 
     let sql = format!("SELECT * FROM {} LIMIT {} OFFSET {}", name, limit, offset);
     match state.db.execute_sql(&sql) {
-        Ok(crate::engine::SqlResult::Query { columns, column_types, rows }) => {
-            let json_rows: Vec<BTreeMap<String, serde_json::Value>> = rows.iter().map(|row| {
-                let mut map = BTreeMap::new();
-                for col in &columns {
-                    let val = row.get(col).unwrap_or(&Value::Null);
-                    map.insert(col.clone(), value_to_json(val));
-                }
-                map
-            }).collect();
+        Ok(crate::engine::SqlResult::Query {
+            columns,
+            column_types,
+            rows,
+        }) => {
+            let json_rows: Vec<BTreeMap<String, serde_json::Value>> = rows
+                .iter()
+                .map(|row| {
+                    let mut map = BTreeMap::new();
+                    for col in &columns {
+                        let val = row.get(col).unwrap_or(&Value::Null);
+                        map.insert(col.clone(), value_to_json(val));
+                    }
+                    map
+                })
+                .collect();
 
-            (StatusCode::OK, Json(DataResponse {
-                columns,
-                column_types: column_types.iter().map(|t| value_type_name(t).to_string()).collect(),
-                rows: json_rows,
-                total,
-            })).into_response()
+            (
+                StatusCode::OK,
+                Json(DataResponse {
+                    columns,
+                    column_types: column_types
+                        .iter()
+                        .map(|t| value_type_name(t).to_string())
+                        .collect(),
+                    rows: json_rows,
+                    total,
+                }),
+            )
+                .into_response()
         }
-        Ok(_) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { error: "unexpected result".into() })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorBody { error: e.to_string() })).into_response(),
+        Ok(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: "unexpected result".into(),
+            }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorBody {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -490,75 +669,85 @@ async fn execute_query(
     headers: HeaderMap,
     Json(req): Json<QueryRequest>,
 ) -> Response {
-    if let Err(r) = require_auth(&headers, &state) { return r; }
+    if let Err(r) = require_auth(&headers, &state) {
+        return r;
+    }
 
     match state.db.execute_sql(&req.sql) {
         Ok(result) => {
             let resp = match result {
-                crate::engine::SqlResult::Query { columns, column_types, rows } => {
-                    let json_rows: Vec<BTreeMap<String, serde_json::Value>> = rows.iter().map(|row| {
-                        let mut map = BTreeMap::new();
-                        for col in &columns {
-                            let val = row.get(col).unwrap_or(&Value::Null);
-                            map.insert(col.clone(), value_to_json(val));
-                        }
-                        map
-                    }).collect();
+                crate::engine::SqlResult::Query {
+                    columns,
+                    column_types,
+                    rows,
+                } => {
+                    let json_rows: Vec<BTreeMap<String, serde_json::Value>> = rows
+                        .iter()
+                        .map(|row| {
+                            let mut map = BTreeMap::new();
+                            for col in &columns {
+                                let val = row.get(col).unwrap_or(&Value::Null);
+                                map.insert(col.clone(), value_to_json(val));
+                            }
+                            map
+                        })
+                        .collect();
                     QueryResponse {
                         result_type: "query".into(),
                         columns: Some(columns),
-                        column_types: Some(column_types.iter().map(|t| value_type_name(t).to_string()).collect()),
+                        column_types: Some(
+                            column_types
+                                .iter()
+                                .map(|t| value_type_name(t).to_string())
+                                .collect(),
+                        ),
                         rows: Some(json_rows),
                         affected: None,
                         message: None,
                     }
                 }
-                crate::engine::SqlResult::Execute(count) => {
-                    QueryResponse {
-                        result_type: "execute".into(),
-                        columns: None,
-                        column_types: None,
-                        rows: None,
-                        affected: Some(count),
-                        message: Some(format!("{} row(s) affected", count)),
-                    }
-                }
-                crate::engine::SqlResult::Begin(txn_id) => {
-                    QueryResponse {
-                        result_type: "begin".into(),
-                        columns: None,
-                        column_types: None,
-                        rows: None,
-                        affected: None,
-                        message: Some(format!("transaction {} started", txn_id)),
-                    }
-                }
-                crate::engine::SqlResult::Commit => {
-                    QueryResponse {
-                        result_type: "commit".into(),
-                        columns: None,
-                        column_types: None,
-                        rows: None,
-                        affected: None,
-                        message: Some("committed".into()),
-                    }
-                }
-                crate::engine::SqlResult::Rollback => {
-                    QueryResponse {
-                        result_type: "rollback".into(),
-                        columns: None,
-                        column_types: None,
-                        rows: None,
-                        affected: None,
-                        message: Some("rolled back".into()),
-                    }
-                }
+                crate::engine::SqlResult::Execute(count) => QueryResponse {
+                    result_type: "execute".into(),
+                    columns: None,
+                    column_types: None,
+                    rows: None,
+                    affected: Some(count),
+                    message: Some(format!("{} row(s) affected", count)),
+                },
+                crate::engine::SqlResult::Begin(txn_id) => QueryResponse {
+                    result_type: "begin".into(),
+                    columns: None,
+                    column_types: None,
+                    rows: None,
+                    affected: None,
+                    message: Some(format!("transaction {} started", txn_id)),
+                },
+                crate::engine::SqlResult::Commit => QueryResponse {
+                    result_type: "commit".into(),
+                    columns: None,
+                    column_types: None,
+                    rows: None,
+                    affected: None,
+                    message: Some("committed".into()),
+                },
+                crate::engine::SqlResult::Rollback => QueryResponse {
+                    result_type: "rollback".into(),
+                    columns: None,
+                    column_types: None,
+                    rows: None,
+                    affected: None,
+                    message: Some("rolled back".into()),
+                },
             };
             (StatusCode::OK, Json(resp)).into_response()
         }
-        Err(e) => {
-            (StatusCode::BAD_REQUEST, Json(ErrorBody { error: e.to_string() })).into_response()
-        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -566,21 +755,24 @@ async fn execute_query(
 // User management endpoints
 // ---------------------------------------------------------------------------
 
-async fn list_users(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(r) = require_auth(&headers, &state) { return r; }
+async fn list_users(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = require_auth(&headers, &state) {
+        return r;
+    }
 
     match &state.auth {
         Some(auth) => {
             let guard = auth.lock().unwrap();
-            let users: Vec<UserInfo> = guard.list_users().iter().map(|u| UserInfo { username: u.to_string() }).collect();
+            let users: Vec<UserInfo> = guard
+                .list_users()
+                .iter()
+                .map(|u| UserInfo {
+                    username: u.to_string(),
+                })
+                .collect();
             (StatusCode::OK, Json(users)).into_response()
         }
-        None => {
-            (StatusCode::OK, Json(Vec::<UserInfo>::new())).into_response()
-        }
+        None => (StatusCode::OK, Json(Vec::<UserInfo>::new())).into_response(),
     }
 }
 
@@ -589,20 +781,38 @@ async fn create_user(
     headers: HeaderMap,
     Json(req): Json<CreateUserRequest>,
 ) -> Response {
-    if let Err(r) = require_auth(&headers, &state) { return r; }
+    if let Err(r) = require_auth(&headers, &state) {
+        return r;
+    }
 
     match &state.auth {
         Some(auth) => {
             let mut guard = auth.lock().unwrap();
             if guard.user_exists(&req.username) {
-                return (StatusCode::CONFLICT, Json(ErrorBody { error: "user already exists".into() })).into_response();
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ErrorBody {
+                        error: "user already exists".into(),
+                    }),
+                )
+                    .into_response();
             }
             guard.add_user(&req.username, &req.password);
-            (StatusCode::CREATED, Json(UserInfo { username: req.username })).into_response()
+            (
+                StatusCode::CREATED,
+                Json(UserInfo {
+                    username: req.username,
+                }),
+            )
+                .into_response()
         }
-        None => {
-            (StatusCode::BAD_REQUEST, Json(ErrorBody { error: "authentication not enabled".into() })).into_response()
-        }
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "authentication not enabled".into(),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -611,7 +821,9 @@ async fn delete_user(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
-    if let Err(r) = require_auth(&headers, &state) { return r; }
+    if let Err(r) = require_auth(&headers, &state) {
+        return r;
+    }
 
     match &state.auth {
         Some(auth) => {
@@ -619,11 +831,21 @@ async fn delete_user(
             if guard.remove_user(&name) {
                 StatusCode::NO_CONTENT.into_response()
             } else {
-                (StatusCode::NOT_FOUND, Json(ErrorBody { error: "user not found".into() })).into_response()
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorBody {
+                        error: "user not found".into(),
+                    }),
+                )
+                    .into_response()
             }
         }
-        None => {
-            (StatusCode::BAD_REQUEST, Json(ErrorBody { error: "authentication not enabled".into() })).into_response()
-        }
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorBody {
+                error: "authentication not enabled".into(),
+            }),
+        )
+            .into_response(),
     }
 }

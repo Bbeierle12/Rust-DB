@@ -50,11 +50,10 @@ impl MvccStore {
     ///
     /// Used for write-write conflict detection in OCC.
     pub fn has_write_after(&self, key: &[u8], after_ts: u64) -> bool {
-        if let Some(chain) = self.versions.get(key) {
-            if let Some(latest) = chain.first() {
+        if let Some(chain) = self.versions.get(key)
+            && let Some(latest) = chain.first() {
                 return latest.commit_ts > after_ts;
             }
-        }
         false
     }
 
@@ -64,13 +63,7 @@ impl MvccStore {
     pub fn write(&mut self, key: Vec<u8>, commit_ts: u64, value: Option<Vec<u8>>) {
         let chain = self.versions.entry(key).or_default();
         // Prepend (newest first).
-        chain.insert(
-            0,
-            Version {
-                commit_ts,
-                value,
-            },
-        );
+        chain.insert(0, Version { commit_ts, value });
     }
 
     /// Scan all keys in the given range at the snapshot timestamp.
@@ -93,11 +86,10 @@ impl MvccStore {
 
         for (key, chain) in iter {
             // Check end bound.
-            if let Some(e) = end {
-                if key.as_slice() >= e {
+            if let Some(e) = end
+                && key.as_slice() >= e {
                     break;
                 }
-            }
 
             // Find the visible version at snapshot_ts.
             for version in chain {
@@ -165,6 +157,33 @@ impl MvccStore {
 
     pub fn gc_watermark(&self) -> u64 {
         self.gc_watermark
+    }
+
+    /// Snapshot the latest committed version of every key.
+    ///
+    /// Returns (key, value_or_tombstone, commit_ts) triples for every key
+    /// that has at least one version. Tombstones are included so that a
+    /// subsequent WAL replay doesn't resurrect deleted keys.
+    pub fn snapshot_latest(&self) -> Vec<(Vec<u8>, Option<Vec<u8>>, u64)> {
+        let mut out = Vec::with_capacity(self.versions.len());
+        for (key, chain) in &self.versions {
+            if let Some(latest) = chain.first() {
+                out.push((key.clone(), latest.value.clone(), latest.commit_ts));
+            }
+        }
+        out
+    }
+
+    /// Replace the version chain for each given key with a single version at
+    /// `commit_ts`. Used during snapshot load: any prior history is discarded.
+    pub fn install_snapshot_entries(
+        &mut self,
+        entries: impl IntoIterator<Item = (Vec<u8>, Option<Vec<u8>>, u64)>,
+    ) {
+        for (key, value, commit_ts) in entries {
+            self.versions
+                .insert(key, vec![Version { commit_ts, value }]);
+        }
     }
 }
 

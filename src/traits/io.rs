@@ -3,7 +3,6 @@
 /// In the state-machine architecture, IO operations are modeled as messages.
 /// These traits exist for the *real* (non-simulated) production path.
 /// In simulation, all IO goes through the message bus instead.
-
 use std::io;
 
 /// Disk IO operations.

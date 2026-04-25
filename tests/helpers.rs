@@ -53,7 +53,13 @@ impl StateMachine for Echo {
     }
 
     fn receive(&mut self, from: ActorId, msg: Message) -> Option<Vec<(Message, Destination)>> {
-        Some(vec![(msg, Destination { actor: from, delay: 0 })])
+        Some(vec![(
+            msg,
+            Destination {
+                actor: from,
+                delay: 0,
+            },
+        )])
     }
 
     fn tick(&mut self, _now: u64) -> Option<Vec<(Message, Destination)>> {

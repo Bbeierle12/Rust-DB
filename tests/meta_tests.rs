@@ -12,8 +12,10 @@ mod helpers;
 
 use helpers::Collector;
 use rust_dst_db::config::DatabaseConfig;
+use rust_dst_db::sim::buggify::{
+    buggify, buggify_enabled, set_buggify_enabled, set_buggify_seed, with_buggify,
+};
 use rust_dst_db::sim::bus::MessageBus;
-use rust_dst_db::sim::buggify::{buggify, buggify_enabled, set_buggify_enabled, set_buggify_seed, with_buggify};
 use rust_dst_db::sim::disk::SimDisk;
 use rust_dst_db::sim::fault::{FaultConfig, FaultInjector};
 use rust_dst_db::traits::message::{ActorId, Message};
@@ -59,14 +61,13 @@ fn buggify_enabled_returns_some_trues() {
 
 #[test]
 fn buggify_same_seed_same_sequence() {
-    let seq_a: Vec<bool> = with_buggify(12345, || {
-        (0..100).map(|_| buggify()).collect()
-    });
-    let seq_b: Vec<bool> = with_buggify(12345, || {
-        (0..100).map(|_| buggify()).collect()
-    });
+    let seq_a: Vec<bool> = with_buggify(12345, || (0..100).map(|_| buggify()).collect());
+    let seq_b: Vec<bool> = with_buggify(12345, || (0..100).map(|_| buggify()).collect());
 
-    assert_eq!(seq_a, seq_b, "Same seed must produce identical BUGGIFY sequence");
+    assert_eq!(
+        seq_a, seq_b,
+        "Same seed must produce identical BUGGIFY sequence"
+    );
 }
 
 #[test]
@@ -75,7 +76,10 @@ fn buggify_different_seeds_different_sequences() {
     let seq_b: Vec<bool> = with_buggify(222, || (0..100).map(|_| buggify()).collect());
 
     // Different seeds must produce different sequences (probabilistically certain).
-    assert_ne!(seq_a, seq_b, "Different seeds should yield different sequences");
+    assert_ne!(
+        seq_a, seq_b,
+        "Different seeds should yield different sequences"
+    );
 }
 
 #[test]
@@ -115,7 +119,12 @@ fn run_workload(seed: u64, fault_prob: f64) -> Vec<String> {
     let mut bus = MessageBus::new(seed, injector, &cfg);
 
     bus.register(Box::new(SimDisk::new(DISK_ID, false, &cfg)));
-    bus.register(Box::new(WalWriter::new(WAL_WRITER_ID, DISK_ID, TXN_MGR_ID, &cfg)));
+    bus.register(Box::new(WalWriter::new(
+        WAL_WRITER_ID,
+        DISK_ID,
+        TXN_MGR_ID,
+        &cfg,
+    )));
     bus.register(Box::new(TransactionManager::new(TXN_MGR_ID, WAL_WRITER_ID)));
     bus.register(Box::new(Collector::new(CLIENT_ID)));
 
@@ -125,11 +134,19 @@ fn run_workload(seed: u64, fault_prob: f64) -> Vec<String> {
     for attempt in 0..20 {
         bus.send(CLIENT_ID, TXN_MGR_ID, Message::TxnBegin, attempt);
         bus.run(50);
-        txn_id = bus.actor::<Collector>(CLIENT_ID).unwrap()
+        txn_id = bus
+            .actor::<Collector>(CLIENT_ID)
+            .unwrap()
             .received
             .iter()
             .rev()
-            .find_map(|m| if let Message::TxnBeginOk { txn_id } = m { Some(*txn_id) } else { None });
+            .find_map(|m| {
+                if let Message::TxnBeginOk { txn_id } = m {
+                    Some(*txn_id)
+                } else {
+                    None
+                }
+            });
         if txn_id.is_some() {
             break;
         }
@@ -203,12 +220,7 @@ fn meta_test_multiple_seeds_all_deterministic() {
     for seed in [0u64, 1, 42, 100, 999, 0xDEADBEEF, u64::MAX / 2] {
         let trace_a = run_workload(seed, 0.05);
         let trace_b = run_workload(seed, 0.05);
-        assert_eq!(
-            trace_a,
-            trace_b,
-            "DETERMINISM REGRESSION at seed {}",
-            seed
-        );
+        assert_eq!(trace_a, trace_b, "DETERMINISM REGRESSION at seed {}", seed);
     }
 }
 

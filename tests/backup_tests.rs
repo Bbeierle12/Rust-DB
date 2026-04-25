@@ -29,10 +29,25 @@ fn setup_full(seed: u64, cfg: &DatabaseConfig) -> MessageBus {
     let mut bus = MessageBus::new(seed, injector, cfg);
 
     bus.register(Box::new(SimDisk::new(DISK_ID, false, cfg)));
-    bus.register(Box::new(WalWriter::new(WAL_WRITER_ID, DISK_ID, BTREE_ID, cfg)));
+    bus.register(Box::new(WalWriter::new(
+        WAL_WRITER_ID,
+        DISK_ID,
+        BTREE_ID,
+        cfg,
+    )));
     bus.register(Box::new(BufferPool::new(BUF_POOL_ID, DISK_ID, cfg)));
-    bus.register(Box::new(BTreeEngine::new(BTREE_ID, BUF_POOL_ID, WAL_WRITER_ID, cfg)));
-    bus.register(Box::new(BackupManager::new(BACKUP_ID, BUF_POOL_ID, WAL_WRITER_ID, DISK_ID)));
+    bus.register(Box::new(BTreeEngine::new(
+        BTREE_ID,
+        BUF_POOL_ID,
+        WAL_WRITER_ID,
+        cfg,
+    )));
+    bus.register(Box::new(BackupManager::new(
+        BACKUP_ID,
+        BUF_POOL_ID,
+        WAL_WRITER_ID,
+        DISK_ID,
+    )));
     bus.register(Box::new(Collector::new(CLIENT_ID)));
 
     bus
@@ -45,8 +60,18 @@ fn setup_wal_only(seed: u64, cfg: &DatabaseConfig) -> MessageBus {
 
     // Use a fake BufPool actor (CLIENT_ID acts as dummy buf_pool).
     bus.register(Box::new(SimDisk::new(DISK_ID, false, cfg)));
-    bus.register(Box::new(WalWriter::new(WAL_WRITER_ID, DISK_ID, CLIENT_ID, cfg)));
-    bus.register(Box::new(BackupManager::new(BACKUP_ID, CLIENT_ID, WAL_WRITER_ID, DISK_ID)));
+    bus.register(Box::new(WalWriter::new(
+        WAL_WRITER_ID,
+        DISK_ID,
+        CLIENT_ID,
+        cfg,
+    )));
+    bus.register(Box::new(BackupManager::new(
+        BACKUP_ID,
+        CLIENT_ID,
+        WAL_WRITER_ID,
+        DISK_ID,
+    )));
     bus.register(Box::new(Collector::new(CLIENT_ID)));
 
     bus
@@ -72,7 +97,10 @@ fn backup_creates_checkpoint() {
 
     // Check CLIENT got BufPoolFlush.
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let got_flush = client.received.iter().any(|m| matches!(m, Message::BufPoolFlush));
+    let got_flush = client
+        .received
+        .iter()
+        .any(|m| matches!(m, Message::BufPoolFlush));
     assert!(got_flush, "BackupManager should have sent BufPoolFlush");
 
     // Manually reply BufPoolFlushOk from CLIENT to BackupManager.
@@ -81,7 +109,10 @@ fn backup_creates_checkpoint() {
 
     // BackupManager should send BackupCreated.
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let created = client.received.iter().find(|m| matches!(m, Message::BackupCreated { .. }));
+    let created = client
+        .received
+        .iter()
+        .find(|m| matches!(m, Message::BackupCreated { .. }));
     assert!(created.is_some(), "Should receive BackupCreated");
     if let Some(Message::BackupCreated { checkpoint_id }) = created {
         assert_eq!(*checkpoint_id, 0, "First checkpoint should have id=0");
@@ -95,7 +126,14 @@ fn checkpoint_contains_wal_data() {
     let mut bus = setup_wal_only(42, &cfg);
 
     // Append data to WAL.
-    bus.send(CLIENT_ID, WAL_WRITER_ID, Message::WalAppend { data: b"hello".to_vec() }, 0);
+    bus.send(
+        CLIENT_ID,
+        WAL_WRITER_ID,
+        Message::WalAppend {
+            data: b"hello".to_vec(),
+        },
+        0,
+    );
     bus.run(50);
 
     // Create backup.
@@ -105,7 +143,10 @@ fn checkpoint_contains_wal_data() {
     bus.run(100);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let created = client.received.iter().find(|m| matches!(m, Message::BackupCreated { .. }));
+    let created = client
+        .received
+        .iter()
+        .find(|m| matches!(m, Message::BackupCreated { .. }));
     assert!(created.is_some());
 
     // Inspect the checkpoint stored in the BackupManager.
@@ -114,7 +155,10 @@ fn checkpoint_contains_wal_data() {
     // WAL file (file_id = wal_file_id from cfg = 0) should have data.
     let wal_file_id = cfg.wal_file_id;
     assert!(
-        cp.files.get(&wal_file_id).map(|d| !d.is_empty()).unwrap_or(false),
+        cp.files
+            .get(&wal_file_id)
+            .map(|d| !d.is_empty())
+            .unwrap_or(false),
         "WAL file should be non-empty in checkpoint"
     );
 }
@@ -122,12 +166,25 @@ fn checkpoint_contains_wal_data() {
 /// Test 3: Checkpoint files[1] (B-tree pages) is non-empty after BTree writes.
 #[test]
 fn checkpoint_contains_page_data() {
-    let cfg = DatabaseConfig { btree_max_leaf_entries: 4, btree_max_internal_keys: 4, buffer_pool_pages: 64, ..DatabaseConfig::default() };
+    let cfg = DatabaseConfig {
+        btree_max_leaf_entries: 4,
+        btree_max_internal_keys: 4,
+        buffer_pool_pages: 64,
+        ..DatabaseConfig::default()
+    };
     let mut bus = setup_full(42, &cfg);
 
     // Write some B-tree data (flushes pages to disk via BufPool).
     for i in 0u8..3 {
-        bus.send(CLIENT_ID, BTREE_ID, Message::BTreePut { key: vec![i], value: vec![i * 10] }, 0);
+        bus.send(
+            CLIENT_ID,
+            BTREE_ID,
+            Message::BTreePut {
+                key: vec![i],
+                value: vec![i * 10],
+            },
+            0,
+        );
         bus.run(100);
     }
 
@@ -140,14 +197,20 @@ fn checkpoint_contains_page_data() {
     bus.run(200);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let created = client.received.iter().find(|m| matches!(m, Message::BackupCreated { .. }));
+    let created = client
+        .received
+        .iter()
+        .find(|m| matches!(m, Message::BackupCreated { .. }));
     assert!(created.is_some(), "BackupCreated should be received");
 
     let backup = bus.actor::<BackupManager>(BACKUP_ID).unwrap();
     let cp = backup.get_checkpoint(0).expect("Checkpoint 0 should exist");
     // B-tree pages (file_id=1) should be captured.
     assert!(
-        cp.files.get(&cfg.btree_data_file_id).map(|d| !d.is_empty()).unwrap_or(false),
+        cp.files
+            .get(&cfg.btree_data_file_id)
+            .map(|d| !d.is_empty())
+            .unwrap_or(false),
         "B-tree page file should be non-empty in checkpoint"
     );
 }
@@ -187,7 +250,14 @@ fn restore_writes_files_back_to_disk() {
     let mut bus = setup_wal_only(42, &cfg);
 
     // Write WAL data.
-    bus.send(CLIENT_ID, WAL_WRITER_ID, Message::WalAppend { data: b"payload".to_vec() }, 0);
+    bus.send(
+        CLIENT_ID,
+        WAL_WRITER_ID,
+        Message::WalAppend {
+            data: b"payload".to_vec(),
+        },
+        0,
+    );
     bus.run(50);
 
     // Create backup.
@@ -197,35 +267,70 @@ fn restore_writes_files_back_to_disk() {
     bus.run(100);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    assert!(client.received.iter().any(|m| matches!(m, Message::BackupCreated { checkpoint_id: 0 })));
+    assert!(
+        client
+            .received
+            .iter()
+            .any(|m| matches!(m, Message::BackupCreated { checkpoint_id: 0 }))
+    );
 
     // Get original WAL file contents.
     let disk = bus.actor::<SimDisk>(DISK_ID).unwrap();
-    let original_wal = disk.file_contents(cfg.wal_file_id).cloned().unwrap_or_default();
+    let original_wal = disk
+        .file_contents(cfg.wal_file_id)
+        .cloned()
+        .unwrap_or_default();
 
     // Restore.
-    bus.send(CLIENT_ID, BACKUP_ID, Message::BackupRestore { checkpoint_id: 0 }, 0);
+    bus.send(
+        CLIENT_ID,
+        BACKUP_ID,
+        Message::BackupRestore { checkpoint_id: 0 },
+        0,
+    );
     bus.run(100);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let restored = client.received.iter().any(|m| matches!(m, Message::BackupRestored));
+    let restored = client
+        .received
+        .iter()
+        .any(|m| matches!(m, Message::BackupRestored));
     assert!(restored, "BackupRestored should be received");
 
     // Verify disk contents match.
     let disk = bus.actor::<SimDisk>(DISK_ID).unwrap();
-    let restored_wal = disk.file_contents(cfg.wal_file_id).cloned().unwrap_or_default();
-    assert_eq!(restored_wal, original_wal, "WAL file should be restored to checkpoint state");
+    let restored_wal = disk
+        .file_contents(cfg.wal_file_id)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        restored_wal, original_wal,
+        "WAL file should be restored to checkpoint state"
+    );
 }
 
 /// Test 6: Write 5 keys → backup → "clear" disk by overwriting → restore → all keys readable.
 #[test]
 fn data_survives_backup_restore() {
-    let cfg = DatabaseConfig { btree_max_leaf_entries: 4, btree_max_internal_keys: 4, buffer_pool_pages: 64, ..DatabaseConfig::default() };
+    let cfg = DatabaseConfig {
+        btree_max_leaf_entries: 4,
+        btree_max_internal_keys: 4,
+        buffer_pool_pages: 64,
+        ..DatabaseConfig::default()
+    };
     let mut bus = setup_full(42, &cfg);
 
     // Write 5 keys.
     for i in 0u8..5 {
-        bus.send(CLIENT_ID, BTREE_ID, Message::BTreePut { key: vec![i], value: vec![i + 100] }, 0);
+        bus.send(
+            CLIENT_ID,
+            BTREE_ID,
+            Message::BTreePut {
+                key: vec![i],
+                value: vec![i + 100],
+            },
+            0,
+        );
         bus.run(100);
     }
 
@@ -238,24 +343,54 @@ fn data_survives_backup_restore() {
     bus.run(200);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    assert!(client.received.iter().any(|m| matches!(m, Message::BackupCreated { .. })), "BackupCreated expected");
+    assert!(
+        client
+            .received
+            .iter()
+            .any(|m| matches!(m, Message::BackupCreated { .. })),
+        "BackupCreated expected"
+    );
 
     // Restore.
-    bus.send(CLIENT_ID, BACKUP_ID, Message::BackupRestore { checkpoint_id: 0 }, 0);
+    bus.send(
+        CLIENT_ID,
+        BACKUP_ID,
+        Message::BackupRestore { checkpoint_id: 0 },
+        0,
+    );
     bus.run(200);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    assert!(client.received.iter().any(|m| matches!(m, Message::BackupRestored)), "BackupRestored expected");
+    assert!(
+        client
+            .received
+            .iter()
+            .any(|m| matches!(m, Message::BackupRestored)),
+        "BackupRestored expected"
+    );
 }
 
 /// Test 7: Backup after writes on buffered disk still captures data (flush happens).
 #[test]
 fn backup_flushes_dirty_pages() {
-    let cfg = DatabaseConfig { btree_max_leaf_entries: 4, btree_max_internal_keys: 4, buffer_pool_pages: 64, ..DatabaseConfig::default() };
+    let cfg = DatabaseConfig {
+        btree_max_leaf_entries: 4,
+        btree_max_internal_keys: 4,
+        buffer_pool_pages: 64,
+        ..DatabaseConfig::default()
+    };
     let mut bus = setup_full(42, &cfg);
 
     // Write a key (dirty in buffer pool, not yet on disk).
-    bus.send(CLIENT_ID, BTREE_ID, Message::BTreePut { key: b"key".to_vec(), value: b"val".to_vec() }, 0);
+    bus.send(
+        CLIENT_ID,
+        BTREE_ID,
+        Message::BTreePut {
+            key: b"key".to_vec(),
+            value: b"val".to_vec(),
+        },
+        0,
+    );
     bus.run(100);
 
     // Create backup — should flush dirty pages first.
@@ -263,8 +398,14 @@ fn backup_flushes_dirty_pages() {
     bus.run(300);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let created = client.received.iter().find(|m| matches!(m, Message::BackupCreated { .. }));
-    assert!(created.is_some(), "BackupCreated expected even with dirty pages");
+    let created = client
+        .received
+        .iter()
+        .find(|m| matches!(m, Message::BackupCreated { .. }));
+    assert!(
+        created.is_some(),
+        "BackupCreated expected even with dirty pages"
+    );
 }
 
 /// Test 8: checkpoint.last_fsynced_lsn > 0 after commit + backup.
@@ -274,7 +415,14 @@ fn backup_fsyncs_wal() {
     let mut bus = setup_wal_only(42, &cfg);
 
     // Append to WAL.
-    bus.send(CLIENT_ID, WAL_WRITER_ID, Message::WalAppend { data: b"record1".to_vec() }, 0);
+    bus.send(
+        CLIENT_ID,
+        WAL_WRITER_ID,
+        Message::WalAppend {
+            data: b"record1".to_vec(),
+        },
+        0,
+    );
     bus.run(50);
 
     // Create backup.
@@ -305,10 +453,22 @@ fn multiple_checkpoints_independent() {
     bus.run(100);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    assert!(client.received.iter().any(|m| matches!(m, Message::BackupCreated { checkpoint_id: 0 })));
+    assert!(
+        client
+            .received
+            .iter()
+            .any(|m| matches!(m, Message::BackupCreated { checkpoint_id: 0 }))
+    );
 
     // Write more WAL data.
-    bus.send(CLIENT_ID, WAL_WRITER_ID, Message::WalAppend { data: b"second_write".to_vec() }, 0);
+    bus.send(
+        CLIENT_ID,
+        WAL_WRITER_ID,
+        Message::WalAppend {
+            data: b"second_write".to_vec(),
+        },
+        0,
+    );
     bus.run(50);
 
     // Second backup.
@@ -318,7 +478,12 @@ fn multiple_checkpoints_independent() {
     bus.run(100);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    assert!(client.received.iter().any(|m| matches!(m, Message::BackupCreated { checkpoint_id: 1 })));
+    assert!(
+        client
+            .received
+            .iter()
+            .any(|m| matches!(m, Message::BackupCreated { checkpoint_id: 1 }))
+    );
 
     let backup = bus.actor::<BackupManager>(BACKUP_ID).unwrap();
     assert_eq!(backup.checkpoint_count(), 2, "Should have 2 checkpoints");
@@ -333,7 +498,14 @@ fn backup_deterministic_same_seed() {
         let cfg = DatabaseConfig::default();
         let mut bus = setup_wal_only(seed, &cfg);
 
-        bus.send(CLIENT_ID, WAL_WRITER_ID, Message::WalAppend { data: b"deterministic".to_vec() }, 0);
+        bus.send(
+            CLIENT_ID,
+            WAL_WRITER_ID,
+            Message::WalAppend {
+                data: b"deterministic".to_vec(),
+            },
+            0,
+        );
         bus.run(50);
 
         bus.send(CLIENT_ID, BACKUP_ID, Message::BackupCreate, 0);
@@ -342,11 +514,17 @@ fn backup_deterministic_same_seed() {
         bus.run(100);
 
         let backup = bus.actor::<BackupManager>(BACKUP_ID).unwrap();
-        backup.get_checkpoint(0).map(|cp| cp.encode()).unwrap_or_default()
+        backup
+            .get_checkpoint(0)
+            .map(|cp| cp.encode())
+            .unwrap_or_default()
     }
 
     let cp_a = run_and_get_checkpoint(777);
     let cp_b = run_and_get_checkpoint(777);
-    assert_eq!(cp_a, cp_b, "Same seed should produce identical checkpoint bytes");
+    assert_eq!(
+        cp_a, cp_b,
+        "Same seed should produce identical checkpoint bytes"
+    );
     assert!(!cp_a.is_empty(), "Checkpoint should not be empty");
 }

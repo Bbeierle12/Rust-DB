@@ -13,8 +13,8 @@ use rust_dst_db::traits::message::{ActorId, Message};
 
 const SIM_A_ID: ActorId = ActorId(1);
 const SIM_B_ID: ActorId = ActorId(2);
-const COLL_A_ID: ActorId = ActorId(3);  // client / "node A application"
-const COLL_B_ID: ActorId = ActorId(4);  // "node B application"
+const COLL_A_ID: ActorId = ActorId(3); // client / "node A application"
+const COLL_B_ID: ActorId = ActorId(4); // "node B application"
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -49,12 +49,11 @@ fn two_node_bus(seed: u64) -> MessageBus {
     };
     let mut bus = MessageBus::new(seed, injector, &cfg);
 
-    let mut sim_a = SimNetwork::new(SIM_A_ID, "a", seed, &cfg)
-        .set_app_actor(COLL_A_ID);
+    let mut sim_a = SimNetwork::new(SIM_A_ID, "a", seed, &cfg).set_app_actor(COLL_A_ID);
     sim_a.add_peer("b", SIM_B_ID);
 
-    let mut sim_b = SimNetwork::new(SIM_B_ID, "b", seed.wrapping_add(1), &cfg)
-        .set_app_actor(COLL_B_ID);
+    let mut sim_b =
+        SimNetwork::new(SIM_B_ID, "b", seed.wrapping_add(1), &cfg).set_app_actor(COLL_B_ID);
     sim_b.add_peer("a", SIM_A_ID);
 
     bus.register(Box::new(sim_a));
@@ -97,7 +96,9 @@ fn simnet_two_nodes_communicate() {
     let coll_b = bus.actor::<Collector>(COLL_B_ID).unwrap();
     assert_eq!(coll_b.received.len(), 1, "expected NetRecv at B");
     match &coll_b.received[0] {
-        Message::NetRecv { from_node, data, .. } => {
+        Message::NetRecv {
+            from_node, data, ..
+        } => {
             assert_eq!(from_node, "a");
             assert_eq!(data, b"hello");
         }
@@ -114,7 +115,10 @@ fn simnet_partition_drops_messages() {
     bus.send(
         COLL_A_ID,
         SIM_A_ID,
-        Message::NetPartition { node_a: "a".into(), node_b: "b".into() },
+        Message::NetPartition {
+            node_a: "a".into(),
+            node_b: "b".into(),
+        },
         0,
     );
     bus.run(5);
@@ -158,7 +162,10 @@ fn simnet_heal_restores_communication() {
     bus.send(
         COLL_A_ID,
         SIM_A_ID,
-        Message::NetPartition { node_a: "a".into(), node_b: "b".into() },
+        Message::NetPartition {
+            node_a: "a".into(),
+            node_b: "b".into(),
+        },
         0,
     );
     bus.run(5);
@@ -167,7 +174,11 @@ fn simnet_heal_restores_communication() {
     bus.send(
         COLL_A_ID,
         SIM_A_ID,
-        Message::NetSend { conn_id: 1, to_node: "b".into(), data: b"x".to_vec() },
+        Message::NetSend {
+            conn_id: 1,
+            to_node: "b".into(),
+            data: b"x".to_vec(),
+        },
         0,
     );
     bus.run(10);
@@ -176,7 +187,10 @@ fn simnet_heal_restores_communication() {
     bus.send(
         COLL_A_ID,
         SIM_A_ID,
-        Message::NetHeal { node_a: "a".into(), node_b: "b".into() },
+        Message::NetHeal {
+            node_a: "a".into(),
+            node_b: "b".into(),
+        },
         0,
     );
     bus.run(5);
@@ -185,7 +199,11 @@ fn simnet_heal_restores_communication() {
     bus.send(
         COLL_A_ID,
         SIM_A_ID,
-        Message::NetSend { conn_id: 2, to_node: "b".into(), data: b"hello".to_vec() },
+        Message::NetSend {
+            conn_id: 2,
+            to_node: "b".into(),
+            data: b"hello".to_vec(),
+        },
         0,
     );
     bus.run(20);
@@ -213,7 +231,11 @@ fn simnet_latency_applied() {
     bus.send(
         COLL_A_ID,
         SIM_A_ID,
-        Message::NetSend { conn_id: 1, to_node: "b".into(), data: b"ping".to_vec() },
+        Message::NetSend {
+            conn_id: 1,
+            to_node: "b".into(),
+            data: b"ping".to_vec(),
+        },
         0,
     );
 
@@ -231,7 +253,11 @@ fn simnet_latency_applied() {
     // One more tick delivers the message.
     bus.tick();
     let coll_b = bus.actor::<Collector>(COLL_B_ID).unwrap();
-    assert_eq!(coll_b.received.len(), 1, "NetRecv must arrive at base_latency ticks");
+    assert_eq!(
+        coll_b.received.len(),
+        1,
+        "NetRecv must arrive at base_latency ticks"
+    );
 }
 
 /// Running the same seed twice produces byte-for-byte identical traces.
@@ -311,7 +337,11 @@ fn simnet_fault_injector_interacts() {
         bus.send(
             COLL_A_ID,
             SIM_A_ID,
-            Message::NetSend { conn_id: i, to_node: "b".into(), data: vec![i as u8] },
+            Message::NetSend {
+                conn_id: i,
+                to_node: "b".into(),
+                data: vec![i as u8],
+            },
             0,
         );
     }
@@ -336,7 +366,11 @@ fn simnet_fault_injector_interacts() {
         bus2.send(
             COLL_A_ID,
             SIM_A_ID,
-            Message::NetSend { conn_id: i, to_node: "b".into(), data: vec![i as u8] },
+            Message::NetSend {
+                conn_id: i,
+                to_node: "b".into(),
+                data: vec![i as u8],
+            },
             0,
         );
     }
@@ -373,20 +407,53 @@ fn simnet_multiple_partitions() {
     bus.register(Box::new(Collector::new(COLL_C_ID)));
 
     // Partition A-B only.
-    bus.send(COLL_A_ID, SIM_A_ID, Message::NetPartition { node_a: "a".into(), node_b: "b".into() }, 0);
+    bus.send(
+        COLL_A_ID,
+        SIM_A_ID,
+        Message::NetPartition {
+            node_a: "a".into(),
+            node_b: "b".into(),
+        },
+        0,
+    );
     bus.run(5);
 
     // A→B fails.
-    bus.send(COLL_A_ID, SIM_A_ID, Message::NetSend { conn_id: 1, to_node: "b".into(), data: b"x".to_vec() }, 0);
+    bus.send(
+        COLL_A_ID,
+        SIM_A_ID,
+        Message::NetSend {
+            conn_id: 1,
+            to_node: "b".into(),
+            data: b"x".to_vec(),
+        },
+        0,
+    );
     // A→C succeeds.
-    bus.send(COLL_A_ID, SIM_A_ID, Message::NetSend { conn_id: 2, to_node: "c".into(), data: b"y".to_vec() }, 0);
+    bus.send(
+        COLL_A_ID,
+        SIM_A_ID,
+        Message::NetSend {
+            conn_id: 2,
+            to_node: "c".into(),
+            data: b"y".to_vec(),
+        },
+        0,
+    );
     bus.run(20);
 
     let coll_b = bus.actor::<Collector>(COLL_B_ID).unwrap();
-    assert!(coll_b.received.is_empty(), "B must not receive while A-B partitioned");
+    assert!(
+        coll_b.received.is_empty(),
+        "B must not receive while A-B partitioned"
+    );
 
     let coll_c = bus.actor::<Collector>(COLL_C_ID).unwrap();
-    assert_eq!(coll_c.received.len(), 1, "C must receive; A-C is not partitioned");
+    assert_eq!(
+        coll_c.received.len(),
+        1,
+        "C must receive; A-C is not partitioned"
+    );
 }
 
 /// Partition is bidirectional: A→B and B→A both fail when both SimNetworks
@@ -399,13 +466,19 @@ fn simnet_partition_is_bidirectional() {
     bus.send(
         COLL_A_ID,
         SIM_A_ID,
-        Message::NetPartition { node_a: "a".into(), node_b: "b".into() },
+        Message::NetPartition {
+            node_a: "a".into(),
+            node_b: "b".into(),
+        },
         0,
     );
     bus.send(
         COLL_B_ID,
         SIM_B_ID,
-        Message::NetPartition { node_a: "a".into(), node_b: "b".into() },
+        Message::NetPartition {
+            node_a: "a".into(),
+            node_b: "b".into(),
+        },
         0,
     );
     bus.run(5);
@@ -414,14 +487,22 @@ fn simnet_partition_is_bidirectional() {
     bus.send(
         COLL_A_ID,
         SIM_A_ID,
-        Message::NetSend { conn_id: 1, to_node: "b".into(), data: b"from-a".to_vec() },
+        Message::NetSend {
+            conn_id: 1,
+            to_node: "b".into(),
+            data: b"from-a".to_vec(),
+        },
         0,
     );
     // B → A fails.
     bus.send(
         COLL_B_ID,
         SIM_B_ID,
-        Message::NetSend { conn_id: 2, to_node: "a".into(), data: b"from-b".to_vec() },
+        Message::NetSend {
+            conn_id: 2,
+            to_node: "a".into(),
+            data: b"from-b".to_vec(),
+        },
         0,
     );
     bus.run(20);
@@ -429,22 +510,34 @@ fn simnet_partition_is_bidirectional() {
     // A's collector should have NetSendErr (not NetRecv from B).
     let coll_a = bus.actor::<Collector>(COLL_A_ID).unwrap();
     assert!(
-        coll_a.received.iter().any(|m| matches!(m, Message::NetSendErr { .. })),
+        coll_a
+            .received
+            .iter()
+            .any(|m| matches!(m, Message::NetSendErr { .. })),
         "A must get NetSendErr (A→B blocked)"
     );
     assert!(
-        !coll_a.received.iter().any(|m| matches!(m, Message::NetRecv { .. })),
+        !coll_a
+            .received
+            .iter()
+            .any(|m| matches!(m, Message::NetRecv { .. })),
         "A must not receive NetRecv (B→A blocked)"
     );
 
     // B's collector should have NetSendErr (not NetRecv from A).
     let coll_b = bus.actor::<Collector>(COLL_B_ID).unwrap();
     assert!(
-        coll_b.received.iter().any(|m| matches!(m, Message::NetSendErr { .. })),
+        coll_b
+            .received
+            .iter()
+            .any(|m| matches!(m, Message::NetSendErr { .. })),
         "B must get NetSendErr (B→A blocked)"
     );
     assert!(
-        !coll_b.received.iter().any(|m| matches!(m, Message::NetRecv { .. })),
+        !coll_b
+            .received
+            .iter()
+            .any(|m| matches!(m, Message::NetRecv { .. })),
         "B must not receive NetRecv (A→B blocked)"
     );
 }

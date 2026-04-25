@@ -18,6 +18,8 @@ pub enum Value {
     Uuid([u8; 16]),
     /// Fixed-point decimal: (unscaled_value, scale). E.g. Decimal(12345, 2) = 123.45
     Decimal(i128, u8),
+    /// Dense float32 vector for embeddings.
+    Vector(Vec<f32>),
 }
 
 impl PartialEq for Value {
@@ -39,6 +41,7 @@ impl PartialEq for Value {
                 let b_norm = *bv * 10i128.pow((max_s - *bs) as u32);
                 a_norm == b_norm
             }
+            (Value::Vector(a), Value::Vector(b)) => a == b,
             _ => false,
         }
     }
@@ -63,8 +66,36 @@ impl fmt::Display for Value {
             Value::Date(days) => write!(f, "{}", format_date(*days)),
             Value::Uuid(bytes) => write!(f, "{}", format_uuid(bytes)),
             Value::Decimal(val, scale) => write!(f, "{}", format_decimal(*val, *scale)),
+            Value::Vector(v) => write!(f, "{}", format_vector(v)),
         }
     }
+}
+
+/// Format a vector as `[v1, v2, ...]` with f32 default formatting.
+pub fn format_vector(v: &[f32]) -> String {
+    let mut s = String::with_capacity(v.len() * 6 + 2);
+    s.push('[');
+    for (i, x) in v.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(&x.to_string());
+    }
+    s.push(']');
+    s
+}
+
+/// Parse `[v1, v2, ...]` into `Vec<f32>`. Whitespace-tolerant.
+pub fn parse_vector_str(s: &str) -> Option<Vec<f32>> {
+    let trimmed = s.trim();
+    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    inner
+        .split(',')
+        .map(|p| p.trim().parse::<f32>().ok())
+        .collect()
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -82,9 +113,15 @@ pub fn format_timestamp(us: i64) -> String {
     let min = (secs_in_day % 3600) / 60;
     let sec = secs_in_day % 60;
     if frac_us == 0 {
-        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, hour, min, sec)
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+            y, m, d, hour, min, sec
+        )
     } else {
-        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z", y, m, d, hour, min, sec, frac_us)
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
+            y, m, d, hour, min, sec, frac_us
+        )
     }
 }
 
@@ -98,11 +135,22 @@ pub fn format_date(days: i32) -> String {
 pub fn format_uuid(bytes: &[u8; 16]) -> String {
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0], bytes[1], bytes[2], bytes[3],
-        bytes[4], bytes[5],
-        bytes[6], bytes[7],
-        bytes[8], bytes[9],
-        bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
     )
 }
 
@@ -119,11 +167,19 @@ pub fn format_decimal(val: i128, scale: u8) -> String {
         // Need leading zeros: e.g. 5 with scale 2 -> "0.05"
         let zeros = scale - s.len();
         let result = format!("0.{}{}", "0".repeat(zeros), s);
-        if negative { format!("-{}", result) } else { result }
+        if negative {
+            format!("-{}", result)
+        } else {
+            result
+        }
     } else {
         let (integer, frac) = s.split_at(s.len() - scale);
         let result = format!("{}.{}", integer, frac);
-        if negative { format!("-{}", result) } else { result }
+        if negative {
+            format!("-{}", result)
+        } else {
+            result
+        }
     }
 }
 
@@ -137,7 +193,13 @@ fn days_in_month(y: i32, m: u32) -> u32 {
     match m {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 => if is_leap_year(y) { 29 } else { 28 },
+        2 => {
+            if is_leap_year(y) {
+                29
+            } else {
+                28
+            }
+        }
         _ => 30,
     }
 }
@@ -209,7 +271,7 @@ pub fn parse_date_str(s: &str) -> Option<i32> {
     let y: i32 = parts[0].parse().ok()?;
     let m: u32 = parts[1].parse().ok()?;
     let d: u32 = parts[2].parse().ok()?;
-    if m < 1 || m > 12 || d < 1 || d > days_in_month(y, m) {
+    if !(1..=12).contains(&m) || d < 1 || d > days_in_month(y, m) {
         return None;
     }
     Some(ymd_to_days(y, m, d))
@@ -284,7 +346,11 @@ pub fn parse_decimal_str(s: &str) -> Option<(i128, u8)> {
         let scale = frac_part.len() as u8;
         let combined = format!("{}{}", int_part, frac_part);
         let val: i128 = combined.parse().ok()?;
-        Some(if negative { (-val, scale) } else { (val, scale) })
+        Some(if negative {
+            (-val, scale)
+        } else {
+            (val, scale)
+        })
     } else {
         let val: i128 = s.parse().ok()?;
         Some(if negative { (-val, 0) } else { (val, 0) })
@@ -292,6 +358,9 @@ pub fn parse_decimal_str(s: &str) -> Option<(i128, u8)> {
 }
 
 /// The type tag of a Value, without the data.
+///
+/// `Vector { dim }` carries its dimensionality so the catalog can validate
+/// inserts. Other types are zero-payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueType {
     Null,
@@ -304,6 +373,7 @@ pub enum ValueType {
     Date,
     Uuid,
     Decimal,
+    Vector { dim: u32 },
 }
 
 impl Value {
@@ -319,6 +389,9 @@ impl Value {
             Value::Date(_) => ValueType::Date,
             Value::Uuid(_) => ValueType::Uuid,
             Value::Decimal(_, _) => ValueType::Decimal,
+            Value::Vector(v) => ValueType::Vector {
+                dim: v.len() as u32,
+            },
         }
     }
 
@@ -370,6 +443,13 @@ impl Value {
                 buf.extend_from_slice(&val.to_le_bytes());
                 buf.push(*scale);
             }
+            Value::Vector(v) => {
+                buf.push(10);
+                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                for x in v {
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
+            }
         }
         buf
     }
@@ -398,7 +478,9 @@ impl Value {
             4 => {
                 let len = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
                 pos += 4;
-                let s = std::str::from_utf8(data.get(pos..pos + len)?).ok()?.to_string();
+                let s = std::str::from_utf8(data.get(pos..pos + len)?)
+                    .ok()?
+                    .to_string();
                 pos += len;
                 Some((Value::Text(s), pos))
             }
@@ -430,6 +512,17 @@ impl Value {
                 let scale = *data.get(pos)?;
                 pos += 1;
                 Some((Value::Decimal(val, scale), pos))
+            }
+            10 => {
+                let len = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
+                pos += 4;
+                let mut v = Vec::with_capacity(len);
+                for _ in 0..len {
+                    let x = f32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?);
+                    pos += 4;
+                    v.push(x);
+                }
+                Some((Value::Vector(v), pos))
             }
             _ => None,
         }
@@ -568,8 +661,8 @@ pub enum Expr {
     IsNull(Box<Expr>),
     /// IS NOT NULL check.
     IsNotNull(Box<Expr>),
-    /// LIKE pattern matching (value, pattern).
-    Like(Box<Expr>, Box<Expr>),
+    /// LIKE pattern matching (value, pattern, escape char).
+    Like(Box<Expr>, Box<Expr>, Option<char>),
     /// IN list check (value, list).
     In(Box<Expr>, Vec<Expr>),
     /// BETWEEN check (value, low, high).
@@ -601,9 +694,9 @@ impl Expr {
             }
             Expr::Lit(v) => v.clone(),
             Expr::Eq(l, r) => Value::Bool(l.eval(row) == r.eval(row)),
-            Expr::Lt(l, r) => {
-                Value::Bool(partial_cmp(&l.eval(row), &r.eval(row)) == Some(std::cmp::Ordering::Less))
-            }
+            Expr::Lt(l, r) => Value::Bool(
+                partial_cmp(&l.eval(row), &r.eval(row)) == Some(std::cmp::Ordering::Less),
+            ),
             Expr::Gt(l, r) => Value::Bool(
                 partial_cmp(&l.eval(row), &r.eval(row)) == Some(std::cmp::Ordering::Greater),
             ),
@@ -632,19 +725,19 @@ impl Expr {
             Expr::Mul(l, r) => eval_arith(&l.eval(row), &r.eval(row), ArithOp::Mul),
             Expr::Div(l, r) => eval_arith(&l.eval(row), &r.eval(row), ArithOp::Div),
             Expr::Mod(l, r) => eval_arith(&l.eval(row), &r.eval(row), ArithOp::Mod),
-            Expr::Negate(e) => {
-                match e.eval(row) {
-                    Value::Int64(n) => Value::Int64(-n),
-                    Value::Float64(f) => Value::Float64(-f),
-                    Value::Decimal(v, s) => Value::Decimal(-v, s),
-                    _ => Value::Null,
-                }
-            }
+            Expr::Negate(e) => match e.eval(row) {
+                Value::Int64(n) => Value::Int64(-n),
+                Value::Float64(f) => Value::Float64(-f),
+                Value::Decimal(v, s) => Value::Decimal(-v, s),
+                _ => Value::Null,
+            },
             Expr::IsNull(e) => Value::Bool(e.eval(row).is_null()),
             Expr::IsNotNull(e) => Value::Bool(!e.eval(row).is_null()),
-            Expr::Like(val_expr, pat_expr) => {
+            Expr::Like(val_expr, pat_expr, escape) => {
                 match (val_expr.eval(row), pat_expr.eval(row)) {
-                    (Value::Text(val), Value::Text(pat)) => Value::Bool(like_match(&val, &pat)),
+                    (Value::Text(val), Value::Text(pat)) => {
+                        Value::Bool(like_match(&val, &pat, *escape))
+                    }
                     _ => Value::Null,
                 }
             }
@@ -667,7 +760,11 @@ impl Expr {
                 );
                 Value::Bool(ge_low && le_high)
             }
-            Expr::Case { operand, when_clauses, else_result } => {
+            Expr::Case {
+                operand,
+                when_clauses,
+                else_result,
+            } => {
                 if let Some(op) = operand {
                     let op_val = op.eval(row);
                     for (when_expr, then_expr) in when_clauses {
@@ -708,6 +805,9 @@ impl Expr {
                             .as_micros() as i64;
                         Value::Timestamp(us)
                     }
+                    "COSINE_DISTANCE" => apply_vector_distance(args, row, vec_cosine_distance),
+                    "L2_DISTANCE" => apply_vector_distance(args, row, vec_l2_distance),
+                    "DOT_PRODUCT" => apply_vector_distance(args, row, vec_dot_product),
                     _ => Value::Null,
                 }
             }
@@ -750,18 +850,23 @@ impl Expr {
     pub fn or(l: Expr, r: Expr) -> Self {
         Expr::Or(Box::new(l), Box::new(r))
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn not(e: Expr) -> Self {
         Expr::Not(Box::new(e))
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn add(l: Expr, r: Expr) -> Self {
         Expr::Add(Box::new(l), Box::new(r))
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn sub(l: Expr, r: Expr) -> Self {
         Expr::Sub(Box::new(l), Box::new(r))
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn mul(l: Expr, r: Expr) -> Self {
         Expr::Mul(Box::new(l), Box::new(r))
     }
+    #[allow(clippy::should_implement_trait)]
     pub fn div(l: Expr, r: Expr) -> Self {
         Expr::Div(Box::new(l), Box::new(r))
     }
@@ -778,7 +883,10 @@ impl Expr {
         Expr::IsNotNull(Box::new(e))
     }
     pub fn like(val: Expr, pattern: Expr) -> Self {
-        Expr::Like(Box::new(val), Box::new(pattern))
+        Expr::Like(Box::new(val), Box::new(pattern), None)
+    }
+    pub fn like_escape(val: Expr, pattern: Expr, escape: char) -> Self {
+        Expr::Like(Box::new(val), Box::new(pattern), Some(escape))
     }
     pub fn in_list(val: Expr, list: Vec<Expr>) -> Self {
         Expr::In(Box::new(val), list)
@@ -844,32 +952,44 @@ enum ArithOp {
 
 fn eval_arith(a: &Value, b: &Value, op: ArithOp) -> Value {
     match (a, b) {
-        (Value::Int64(x), Value::Int64(y)) => {
-            match op {
-                ArithOp::Add => Value::Int64(x.wrapping_add(*y)),
-                ArithOp::Sub => Value::Int64(x.wrapping_sub(*y)),
-                ArithOp::Mul => Value::Int64(x.wrapping_mul(*y)),
-                ArithOp::Div => {
-                    if *y == 0 { Value::Null } else { Value::Int64(x / y) }
-                }
-                ArithOp::Mod => {
-                    if *y == 0 { Value::Null } else { Value::Int64(x % y) }
-                }
-            }
-        }
-        (Value::Float64(x), Value::Float64(y)) => {
-            match op {
-                ArithOp::Add => Value::Float64(x + y),
-                ArithOp::Sub => Value::Float64(x - y),
-                ArithOp::Mul => Value::Float64(x * y),
-                ArithOp::Div => {
-                    if *y == 0.0 { Value::Null } else { Value::Float64(x / y) }
-                }
-                ArithOp::Mod => {
-                    if *y == 0.0 { Value::Null } else { Value::Float64(x % y) }
+        (Value::Int64(x), Value::Int64(y)) => match op {
+            ArithOp::Add => Value::Int64(x.wrapping_add(*y)),
+            ArithOp::Sub => Value::Int64(x.wrapping_sub(*y)),
+            ArithOp::Mul => Value::Int64(x.wrapping_mul(*y)),
+            ArithOp::Div => {
+                if *y == 0 {
+                    Value::Null
+                } else {
+                    Value::Int64(x / y)
                 }
             }
-        }
+            ArithOp::Mod => {
+                if *y == 0 {
+                    Value::Null
+                } else {
+                    Value::Int64(x % y)
+                }
+            }
+        },
+        (Value::Float64(x), Value::Float64(y)) => match op {
+            ArithOp::Add => Value::Float64(x + y),
+            ArithOp::Sub => Value::Float64(x - y),
+            ArithOp::Mul => Value::Float64(x * y),
+            ArithOp::Div => {
+                if *y == 0.0 {
+                    Value::Null
+                } else {
+                    Value::Float64(x / y)
+                }
+            }
+            ArithOp::Mod => {
+                if *y == 0.0 {
+                    Value::Null
+                } else {
+                    Value::Float64(x % y)
+                }
+            }
+        },
         (Value::Int64(x), Value::Float64(y)) => {
             eval_arith(&Value::Float64(*x as f64), &Value::Float64(*y), op)
         }
@@ -877,35 +997,27 @@ fn eval_arith(a: &Value, b: &Value, op: ArithOp) -> Value {
             eval_arith(&Value::Float64(*x), &Value::Float64(*y as f64), op)
         }
         // Date + Int64 = Date (add days), Date - Int64 = Date (subtract days)
-        (Value::Date(d), Value::Int64(n)) => {
-            match op {
-                ArithOp::Add => Value::Date(d.wrapping_add(*n as i32)),
-                ArithOp::Sub => Value::Date(d.wrapping_sub(*n as i32)),
-                _ => Value::Null,
-            }
-        }
+        (Value::Date(d), Value::Int64(n)) => match op {
+            ArithOp::Add => Value::Date(d.wrapping_add(*n as i32)),
+            ArithOp::Sub => Value::Date(d.wrapping_sub(*n as i32)),
+            _ => Value::Null,
+        },
         // Date - Date = Int64 (difference in days)
-        (Value::Date(a), Value::Date(b)) => {
-            match op {
-                ArithOp::Sub => Value::Int64((*a as i64) - (*b as i64)),
-                _ => Value::Null,
-            }
-        }
+        (Value::Date(a), Value::Date(b)) => match op {
+            ArithOp::Sub => Value::Int64((*a as i64) - (*b as i64)),
+            _ => Value::Null,
+        },
         // Timestamp + Int64 = Timestamp (add microseconds)
-        (Value::Timestamp(t), Value::Int64(n)) => {
-            match op {
-                ArithOp::Add => Value::Timestamp(t.wrapping_add(*n)),
-                ArithOp::Sub => Value::Timestamp(t.wrapping_sub(*n)),
-                _ => Value::Null,
-            }
-        }
+        (Value::Timestamp(t), Value::Int64(n)) => match op {
+            ArithOp::Add => Value::Timestamp(t.wrapping_add(*n)),
+            ArithOp::Sub => Value::Timestamp(t.wrapping_sub(*n)),
+            _ => Value::Null,
+        },
         // Timestamp - Timestamp = Int64 (difference in microseconds)
-        (Value::Timestamp(a), Value::Timestamp(b)) => {
-            match op {
-                ArithOp::Sub => Value::Int64(*a - *b),
-                _ => Value::Null,
-            }
-        }
+        (Value::Timestamp(a), Value::Timestamp(b)) => match op {
+            ArithOp::Sub => Value::Int64(*a - *b),
+            _ => Value::Null,
+        },
         // Decimal arithmetic
         (Value::Decimal(av, as_), Value::Decimal(bv, bs)) => {
             match op {
@@ -920,9 +1032,7 @@ fn eval_arith(a: &Value, b: &Value, op: ArithOp) -> Value {
                     };
                     Value::Decimal(result, max_s)
                 }
-                ArithOp::Mul => {
-                    Value::Decimal(*av * *bv, *as_ + *bs)
-                }
+                ArithOp::Mul => Value::Decimal(*av * *bv, *as_ + *bs),
                 ArithOp::Div => {
                     if *bv == 0 {
                         Value::Null
@@ -952,21 +1062,25 @@ fn eval_arith(a: &Value, b: &Value, op: ArithOp) -> Value {
 }
 
 /// LIKE pattern matching: `%` matches any sequence of chars, `_` matches exactly one char.
-/// Case-sensitive.
-fn like_match(value: &str, pattern: &str) -> bool {
+/// Case-sensitive. If `escape` is `Some(e)`, the next char after `e` in the pattern is
+/// matched literally (so `\%` matches a literal `%`).
+fn like_match(value: &str, pattern: &str, escape: Option<char>) -> bool {
     let v: Vec<char> = value.chars().collect();
     let p: Vec<char> = pattern.chars().collect();
-    like_match_inner(&v, &p)
+    like_match_inner(&v, &p, escape)
 }
 
-fn like_match_inner(v: &[char], p: &[char]) -> bool {
+fn like_match_inner(v: &[char], p: &[char], escape: Option<char>) -> bool {
     if p.is_empty() {
         return v.is_empty();
     }
+    if let Some(e) = escape
+        && p[0] == e && p.len() >= 2 {
+            // Literal match of the escaped character.
+            return !v.is_empty() && v[0] == p[1] && like_match_inner(&v[1..], &p[2..], escape);
+        }
     match p[0] {
         '%' => {
-            // '%' can match zero or more characters
-            // Skip consecutive '%' for efficiency
             let mut pi = 0;
             while pi < p.len() && p[pi] == '%' {
                 pi += 1;
@@ -976,18 +1090,14 @@ fn like_match_inner(v: &[char], p: &[char]) -> bool {
                 return true;
             }
             for i in 0..=v.len() {
-                if like_match_inner(&v[i..], rest_p) {
+                if like_match_inner(&v[i..], rest_p, escape) {
                     return true;
                 }
             }
             false
         }
-        '_' => {
-            !v.is_empty() && like_match_inner(&v[1..], &p[1..])
-        }
-        c => {
-            !v.is_empty() && v[0] == c && like_match_inner(&v[1..], &p[1..])
-        }
+        '_' => !v.is_empty() && like_match_inner(&v[1..], &p[1..], escape),
+        c => !v.is_empty() && v[0] == c && like_match_inner(&v[1..], &p[1..], escape),
     }
 }
 
@@ -1022,4 +1132,80 @@ fn partial_cmp(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
         _ => None,
     }
+}
+
+// ─── Vector distance helpers ─────────────────────────────────────────────────
+
+fn apply_vector_distance(args: &[Expr], row: &Row, f: fn(&[f32], &[f32]) -> Option<f64>) -> Value {
+    if args.len() != 2 {
+        return Value::Null;
+    }
+    let a = match coerce_to_vector(args[0].eval(row)) {
+        Some(v) => v,
+        None => return Value::Null,
+    };
+    let b = match coerce_to_vector(args[1].eval(row)) {
+        Some(v) => v,
+        None => return Value::Null,
+    };
+    match f(&a, &b) {
+        Some(d) => Value::Float64(d),
+        None => Value::Null,
+    }
+}
+
+/// Accept either Value::Vector directly or a `'[...]'` text literal that
+/// distance-function callers commonly pass as a query parameter.
+fn coerce_to_vector(v: Value) -> Option<Vec<f32>> {
+    match v {
+        Value::Vector(v) => Some(v),
+        Value::Text(s) => parse_vector_str(&s),
+        _ => None,
+    }
+}
+
+/// Cosine distance = 1 - (a·b / (|a||b|)). Returns None on dim mismatch or zero norm.
+pub fn vec_cosine_distance(a: &[f32], b: &[f32]) -> Option<f64> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let mut dot = 0.0f64;
+    let mut na = 0.0f64;
+    let mut nb = 0.0f64;
+    for i in 0..a.len() {
+        let ai = a[i] as f64;
+        let bi = b[i] as f64;
+        dot += ai * bi;
+        na += ai * ai;
+        nb += bi * bi;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return None;
+    }
+    Some(1.0 - dot / (na.sqrt() * nb.sqrt()))
+}
+
+/// Euclidean (L2) distance.
+pub fn vec_l2_distance(a: &[f32], b: &[f32]) -> Option<f64> {
+    if a.len() != b.len() {
+        return None;
+    }
+    let mut sum = 0.0f64;
+    for i in 0..a.len() {
+        let d = a[i] as f64 - b[i] as f64;
+        sum += d * d;
+    }
+    Some(sum.sqrt())
+}
+
+/// Dot product. Note: not a distance — larger means more similar.
+pub fn vec_dot_product(a: &[f32], b: &[f32]) -> Option<f64> {
+    if a.len() != b.len() {
+        return None;
+    }
+    let mut sum = 0.0f64;
+    for i in 0..a.len() {
+        sum += a[i] as f64 * b[i] as f64;
+    }
+    Some(sum)
 }

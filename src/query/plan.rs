@@ -20,7 +20,7 @@ pub enum JoinType {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AggFunc {
     Count,
-    Sum(String),  // column name
+    Sum(String), // column name
     Min(String),
     Max(String),
     Avg(String),
@@ -33,9 +33,7 @@ pub enum AggFunc {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
     /// Full table scan with schema.
-    Scan {
-        schema: Schema,
-    },
+    Scan { schema: Schema },
     /// Filter rows matching a predicate.
     Filter {
         input: Box<LogicalPlan>,
@@ -52,10 +50,7 @@ pub enum LogicalPlan {
         keys: Vec<(String, SortOrder)>,
     },
     /// Limit the number of output rows.
-    Limit {
-        input: Box<LogicalPlan>,
-        n: usize,
-    },
+    Limit { input: Box<LogicalPlan>, n: usize },
     /// Compute aggregate functions, optionally grouped.
     Aggregate {
         input: Box<LogicalPlan>,
@@ -63,14 +58,9 @@ pub enum LogicalPlan {
         agg_funcs: Vec<(String, AggFunc)>, // (output_col_name, func)
     },
     /// Remove duplicate rows.
-    Distinct {
-        input: Box<LogicalPlan>,
-    },
+    Distinct { input: Box<LogicalPlan> },
     /// Skip the first n rows.
-    Offset {
-        input: Box<LogicalPlan>,
-        n: usize,
-    },
+    Offset { input: Box<LogicalPlan>, n: usize },
     /// Join two plans together.
     Join {
         left: Box<LogicalPlan>,
@@ -83,6 +73,13 @@ pub enum LogicalPlan {
         schema: Schema,
         index_name: String,
         lookup_values: Vec<Value>,
+    },
+    /// Compute new columns from arbitrary expressions and add them to each row.
+    /// Inserted before Project / Sort whenever a SELECT item is a function call,
+    /// arithmetic, CASE, etc., so the projection layer can reference them by alias.
+    Extend {
+        input: Box<LogicalPlan>,
+        computed: Vec<(String, Expr)>,
     },
 }
 
@@ -99,6 +96,7 @@ impl LogicalPlan {
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Distinct { input, .. }
             | LogicalPlan::Offset { input, .. } => input.table_name(),
+            LogicalPlan::Extend { input, .. } => input.table_name(),
             LogicalPlan::Join { left, .. } => left.table_name(),
         }
     }
@@ -115,6 +113,7 @@ impl LogicalPlan {
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Distinct { input, .. }
             | LogicalPlan::Offset { input, .. } => input.root_schema(),
+            LogicalPlan::Extend { input, .. } => input.root_schema(),
             LogicalPlan::Join { left, .. } => left.root_schema(),
         }
     }
@@ -159,6 +158,7 @@ impl LogicalPlan {
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Distinct { input, .. }
             | LogicalPlan::Offset { input, .. } => input.collect_table_names_inner(names),
+            LogicalPlan::Extend { input, .. } => input.collect_table_names_inner(names),
             LogicalPlan::Join { left, right, .. } => {
                 left.collect_table_names_inner(names);
                 right.collect_table_names_inner(names);

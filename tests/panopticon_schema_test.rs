@@ -153,12 +153,16 @@ fn panopticon_schema_test() {
     // 3.1 SELECT * FROM devices WHERE status = 'online' LIMIT 10
     println!("\n[3.1] SELECT * FROM devices WHERE status = 'online' LIMIT 10");
     let rows = assert_query(
-        db.execute_sql("SELECT * FROM devices WHERE status = 'online' LIMIT 10").unwrap(),
+        db.execute_sql("SELECT * FROM devices WHERE status = 'online' LIMIT 10")
+            .unwrap(),
         "3.1",
     );
     println!("      → {} rows", rows.len());
     assert_eq!(rows.len(), 3, "expected 3 online devices");
-    assert!(rows.iter().all(|r| r.get("status") == Some(&Value::Text("online".into()))));
+    assert!(
+        rows.iter()
+            .all(|r| r.get("status") == Some(&Value::Text("online".into())))
+    );
     println!("      ✓ PASS: all rows have status='online'");
 
     // 3.2 SELECT * FROM devices WHERE ip LIKE '10.0.0.%'
@@ -171,7 +175,11 @@ fn panopticon_schema_test() {
             println!("      ✓ PASS: {} rows", rows.len());
         }
         None => {
-            gaps.push(("3.2", "LIKE in SELECT WHERE: sql_expr_to_expr_qualified does not handle SqlExpr::Like".into()));
+            gaps.push((
+                "3.2",
+                "LIKE in SELECT WHERE: sql_expr_to_expr_qualified does not handle SqlExpr::Like"
+                    .into(),
+            ));
             println!("      → GAP recorded");
         }
     }
@@ -179,7 +187,8 @@ fn panopticon_schema_test() {
     // 3.3 SELECT COUNT(*) FROM alerts WHERE status = 'open'
     println!("\n[3.3] SELECT COUNT(*) FROM alerts WHERE status = 'open'");
     let rows = assert_query(
-        db.execute_sql("SELECT COUNT(*) FROM alerts WHERE status = 'open'").unwrap(),
+        db.execute_sql("SELECT COUNT(*) FROM alerts WHERE status = 'open'")
+            .unwrap(),
         "3.3",
     );
     assert_eq!(rows.len(), 1, "COUNT(*) must return exactly one row");
@@ -188,84 +197,154 @@ fn panopticon_schema_test() {
     println!("      ✓ PASS: COUNT(*) = {}", cnt);
 
     // 3.4 SELECT severity, COUNT(*) FROM alerts WHERE status = 'open' GROUP BY severity
-    println!("\n[3.4] SELECT severity, COUNT(*) FROM alerts WHERE status = 'open' GROUP BY severity");
+    println!(
+        "\n[3.4] SELECT severity, COUNT(*) FROM alerts WHERE status = 'open' GROUP BY severity"
+    );
     let rows = assert_query(
-        db.execute_sql("SELECT severity, COUNT(*) FROM alerts WHERE status = 'open' GROUP BY severity").unwrap(),
+        db.execute_sql(
+            "SELECT severity, COUNT(*) FROM alerts WHERE status = 'open' GROUP BY severity",
+        )
+        .unwrap(),
         "3.4",
     );
     // critical=1, high=2, low=1
     assert_eq!(rows.len(), 3, "expected 3 severity groups");
     for row in &rows {
-        let sev = match row.get("severity") { Some(Value::Text(s)) => s.as_str(), _ => "?" };
+        let sev = match row.get("severity") {
+            Some(Value::Text(s)) => s.as_str(),
+            _ => "?",
+        };
         let cnt = count_value(row, "count");
         println!("        severity={} count={}", sev, cnt);
     }
-    println!("      ✓ PASS: GROUP BY severity returns {} distinct groups", rows.len());
+    println!(
+        "      ✓ PASS: GROUP BY severity returns {} distinct groups",
+        rows.len()
+    );
 
     // 3.5 SELECT source_tool, COUNT(*) FROM alerts WHERE status = 'open' GROUP BY source_tool
-    println!("\n[3.5] SELECT source_tool, COUNT(*) FROM alerts WHERE status = 'open' GROUP BY source_tool");
+    println!(
+        "\n[3.5] SELECT source_tool, COUNT(*) FROM alerts WHERE status = 'open' GROUP BY source_tool"
+    );
     let rows = assert_query(
-        db.execute_sql("SELECT source_tool, COUNT(*) FROM alerts WHERE status = 'open' GROUP BY source_tool").unwrap(),
+        db.execute_sql(
+            "SELECT source_tool, COUNT(*) FROM alerts WHERE status = 'open' GROUP BY source_tool",
+        )
+        .unwrap(),
         "3.5",
     );
     // suricata=2, nmap=2
     assert_eq!(rows.len(), 2, "expected 2 source_tool groups");
     for row in &rows {
-        let tool = match row.get("source_tool") { Some(Value::Text(s)) => s.as_str(), _ => "?" };
+        let tool = match row.get("source_tool") {
+            Some(Value::Text(s)) => s.as_str(),
+            _ => "?",
+        };
         let cnt = count_value(row, "count");
         println!("        source_tool={} count={}", tool, cnt);
     }
-    println!("      ✓ PASS: GROUP BY source_tool returns {} distinct groups", rows.len());
+    println!(
+        "      ✓ PASS: GROUP BY source_tool returns {} distinct groups",
+        rows.len()
+    );
 
     // 3.6 SELECT * FROM alerts WHERE status = 'open' ORDER BY created_at DESC LIMIT 50
-    println!("\n[3.6] SELECT * FROM alerts WHERE status = 'open' ORDER BY created_at DESC LIMIT 50");
+    println!(
+        "\n[3.6] SELECT * FROM alerts WHERE status = 'open' ORDER BY created_at DESC LIMIT 50"
+    );
     let rows = assert_query(
-        db.execute_sql("SELECT * FROM alerts WHERE status = 'open' ORDER BY created_at DESC LIMIT 50").unwrap(),
+        db.execute_sql(
+            "SELECT * FROM alerts WHERE status = 'open' ORDER BY created_at DESC LIMIT 50",
+        )
+        .unwrap(),
         "3.6",
     );
     assert_eq!(rows.len(), 4, "expected 4 open alerts");
     for i in 0..rows.len().saturating_sub(1) {
-        let a = match rows[i].get("created_at") { Some(Value::Timestamp(ts)) => *ts, _ => 0 };
-        let b = match rows[i + 1].get("created_at") { Some(Value::Timestamp(ts)) => *ts, _ => 0 };
+        let a = match rows[i].get("created_at") {
+            Some(Value::Timestamp(ts)) => *ts,
+            _ => 0,
+        };
+        let b = match rows[i + 1].get("created_at") {
+            Some(Value::Timestamp(ts)) => *ts,
+            _ => 0,
+        };
         assert!(a >= b, "ORDER BY created_at DESC violated at index {}", i);
     }
-    println!("      ✓ PASS: {} rows, ORDER BY created_at DESC verified", rows.len());
+    println!(
+        "      ✓ PASS: {} rows, ORDER BY created_at DESC verified",
+        rows.len()
+    );
 
     // 3.7 SELECT * FROM alerts WHERE device_ip = '10.0.0.99' ORDER BY created_at DESC
     println!("\n[3.7] SELECT * FROM alerts WHERE device_ip = '10.0.0.99' ORDER BY created_at DESC");
     let rows = assert_query(
-        db.execute_sql("SELECT * FROM alerts WHERE device_ip = '10.0.0.99' ORDER BY created_at DESC").unwrap(),
+        db.execute_sql(
+            "SELECT * FROM alerts WHERE device_ip = '10.0.0.99' ORDER BY created_at DESC",
+        )
+        .unwrap(),
         "3.7",
     );
     assert_eq!(rows.len(), 2, "expected 2 alerts for 10.0.0.99");
-    assert!(rows.iter().all(|r| r.get("device_ip") == Some(&Value::Text("10.0.0.99".into()))));
-    println!("      ✓ PASS: {} rows for device_ip='10.0.0.99'", rows.len());
+    assert!(
+        rows.iter()
+            .all(|r| r.get("device_ip") == Some(&Value::Text("10.0.0.99".into())))
+    );
+    println!(
+        "      ✓ PASS: {} rows for device_ip='10.0.0.99'",
+        rows.len()
+    );
 
     // 3.8 SELECT * FROM alerts WHERE device_ip LIKE '10.0.0.%' AND status = 'open'
     // Same LIKE gap as 3.2.
     println!("\n[3.8] SELECT * FROM alerts WHERE device_ip LIKE '10.0.0.%' AND status = 'open'");
-    match try_query(&db, "SELECT * FROM alerts WHERE device_ip LIKE '10.0.0.%' AND status = 'open'", "3.8") {
+    match try_query(
+        &db,
+        "SELECT * FROM alerts WHERE device_ip LIKE '10.0.0.%' AND status = 'open'",
+        "3.8",
+    ) {
         Some(rows) => {
             assert_eq!(rows.len(), 4, "expected 4 open alerts on 10.0.0.x");
             println!("      ✓ PASS: {} rows", rows.len());
         }
         None => {
-            gaps.push(("3.8", "LIKE in SELECT WHERE (compound AND): same sql_expr_to_expr_qualified gap as 3.2".into()));
+            gaps.push((
+                "3.8",
+                "LIKE in SELECT WHERE (compound AND): same sql_expr_to_expr_qualified gap as 3.2"
+                    .into(),
+            ));
             println!("      → GAP recorded");
         }
     }
 
     // 3.9 SELECT * FROM vulnerabilities WHERE severity = 'critical' ORDER BY cvss_score DESC
-    println!("\n[3.9] SELECT * FROM vulnerabilities WHERE severity = 'critical' ORDER BY cvss_score DESC");
+    println!(
+        "\n[3.9] SELECT * FROM vulnerabilities WHERE severity = 'critical' ORDER BY cvss_score DESC"
+    );
     let rows = assert_query(
-        db.execute_sql("SELECT * FROM vulnerabilities WHERE severity = 'critical' ORDER BY cvss_score DESC").unwrap(),
+        db.execute_sql(
+            "SELECT * FROM vulnerabilities WHERE severity = 'critical' ORDER BY cvss_score DESC",
+        )
+        .unwrap(),
         "3.9",
     );
     assert_eq!(rows.len(), 2, "expected 2 critical vulns");
-    let first_score  = match rows[0].get("cvss_score") { Some(Value::Float64(f)) => *f, _ => 0.0 };
-    let second_score = match rows[1].get("cvss_score") { Some(Value::Float64(f)) => *f, _ => 0.0 };
-    assert!(first_score >= second_score, "ORDER BY cvss_score DESC violated");
-    println!("      ✓ PASS: ORDER BY Float64 DESC: {:.1} ≥ {:.1}", first_score, second_score);
+    let first_score = match rows[0].get("cvss_score") {
+        Some(Value::Float64(f)) => *f,
+        _ => 0.0,
+    };
+    let second_score = match rows[1].get("cvss_score") {
+        Some(Value::Float64(f)) => *f,
+        _ => 0.0,
+    };
+    assert!(
+        first_score >= second_score,
+        "ORDER BY cvss_score DESC violated"
+    );
+    println!(
+        "      ✓ PASS: ORDER BY Float64 DESC: {:.1} ≥ {:.1}",
+        first_score, second_score
+    );
 
     // 3.10 SELECT COUNT(*) FROM devices
     println!("\n[3.10] SELECT COUNT(*) FROM devices");
@@ -279,18 +358,22 @@ fn panopticon_schema_test() {
     // 3.11 SELECT status, COUNT(*) FROM devices GROUP BY status
     println!("\n[3.11] SELECT status, COUNT(*) FROM devices GROUP BY status");
     let rows = assert_query(
-        db.execute_sql("SELECT status, COUNT(*) FROM devices GROUP BY status").unwrap(),
+        db.execute_sql("SELECT status, COUNT(*) FROM devices GROUP BY status")
+            .unwrap(),
         "3.11",
     );
     assert_eq!(rows.len(), 2, "expected 2 status groups");
     for row in &rows {
-        let s   = match row.get("status") { Some(Value::Text(t)) => t.as_str(), _ => "?" };
+        let s = match row.get("status") {
+            Some(Value::Text(t)) => t.as_str(),
+            _ => "?",
+        };
         let cnt = count_value(row, "count");
         println!("        status={} count={}", s, cnt);
         match s {
-            "online"  => assert_eq!(cnt, 3),
+            "online" => assert_eq!(cnt, 3),
             "offline" => assert_eq!(cnt, 1),
-            other     => panic!("unexpected status group: {}", other),
+            other => panic!("unexpected status group: {}", other),
         }
     }
     println!("      ✓ PASS: GROUP BY status: online=3 offline=1");
@@ -298,11 +381,15 @@ fn panopticon_schema_test() {
     // 3.12 SELECT * FROM ports WHERE device_id = 'dev-001'
     println!("\n[3.12] SELECT * FROM ports WHERE device_id = 'dev-001'");
     let rows = assert_query(
-        db.execute_sql("SELECT * FROM ports WHERE device_id = 'dev-001'").unwrap(),
+        db.execute_sql("SELECT * FROM ports WHERE device_id = 'dev-001'")
+            .unwrap(),
         "3.12",
     );
     assert_eq!(rows.len(), 2, "expected 2 ports for dev-001");
-    assert!(rows.iter().all(|r| r.get("device_id") == Some(&Value::Text("dev-001".into()))));
+    assert!(
+        rows.iter()
+            .all(|r| r.get("device_id") == Some(&Value::Text("dev-001".into())))
+    );
     println!("      ✓ PASS: {} ports for device_id='dev-001'", rows.len());
 
     // 3.13 LEFT JOIN devices + alerts, online only, grouped
@@ -320,8 +407,14 @@ fn panopticon_schema_test() {
     // AggFunc::Count counts all rows including LEFT JOIN null-padded rows, so dev-004 → count=1.
     assert_eq!(rows.len(), 3, "expected 3 groups for online devices");
     for row in &rows {
-        let ip  = match row.get("devices.ip")       { Some(Value::Text(s)) => s.as_str(), _ => "?" };
-        let cnt = match row.get("alert_count") { Some(Value::Int64(n)) => *n, _ => -1 };
+        let ip = match row.get("devices.ip") {
+            Some(Value::Text(s)) => s.as_str(),
+            _ => "?",
+        };
+        let cnt = match row.get("alert_count") {
+            Some(Value::Int64(n)) => *n,
+            _ => -1,
+        };
         println!("        devices.ip={} alert_count={}", ip, cnt);
     }
     println!("      ✓ PASS: LEFT JOIN + GROUP BY returns one row per online device");
@@ -339,27 +432,38 @@ fn panopticon_schema_test() {
         ON CONFLICT DO NOTHING";
     db.execute_sql(dup_sql).unwrap();
     let total = count_value(
-        &assert_query(db.execute_sql("SELECT COUNT(*) FROM alerts").unwrap(), "3.14-check")[0],
+        &assert_query(
+            db.execute_sql("SELECT COUNT(*) FROM alerts").unwrap(),
+            "3.14-check",
+        )[0],
         "count",
     );
     assert_eq!(total, 5, "ON CONFLICT DO NOTHING must not insert duplicate");
-    println!("      ✓ PASS: duplicate insert silently ignored, total alerts = {}", total);
+    println!(
+        "      ✓ PASS: duplicate insert silently ignored, total alerts = {}",
+        total
+    );
 
     // 3.15 UPDATE SET count = count + 1, updated_at = TIMESTAMP '...' WHERE id = '...'
     println!("\n[3.15] UPDATE alerts SET count = count + 1 WHERE id = 'alert-001'");
     let n = assert_execute(
         db.execute_sql(
             "UPDATE alerts SET count = count + 1, updated_at = TIMESTAMP '2024-03-10 00:00:00' \
-             WHERE id = 'alert-001'"
-        ).unwrap(),
+             WHERE id = 'alert-001'",
+        )
+        .unwrap(),
         "3.15",
     );
     assert_eq!(n, 1, "expected 1 row updated");
     let check_rows = assert_query(
-        db.execute_sql("SELECT * FROM alerts WHERE id = 'alert-001'").unwrap(),
+        db.execute_sql("SELECT * FROM alerts WHERE id = 'alert-001'")
+            .unwrap(),
         "3.15-check",
     );
-    let new_count = match check_rows[0].get("count") { Some(Value::Int64(n)) => *n, _ => -1 };
+    let new_count = match check_rows[0].get("count") {
+        Some(Value::Int64(n)) => *n,
+        _ => -1,
+    };
     assert_eq!(new_count, 2, "count should be 2 after increment");
     println!("      ✓ PASS: count incremented to {}", new_count);
 
@@ -368,14 +472,19 @@ fn panopticon_schema_test() {
     //       TIMESTAMP comparisons work here even if SELECT with LIKE doesn't.
     println!("\n[3.16] DELETE FROM alerts WHERE created_at < TIMESTAMP '2024-02-15 00:00:00'");
     let n = assert_execute(
-        db.execute_sql(
-            "DELETE FROM alerts WHERE created_at < TIMESTAMP '2024-02-15 00:00:00'"
-        ).unwrap(),
+        db.execute_sql("DELETE FROM alerts WHERE created_at < TIMESTAMP '2024-02-15 00:00:00'")
+            .unwrap(),
         "3.16",
     );
-    assert_eq!(n, 1, "expected 1 old alert deleted (alert-003, created 2024-02-01)");
+    assert_eq!(
+        n, 1,
+        "expected 1 old alert deleted (alert-003, created 2024-02-01)"
+    );
     let remaining = count_value(
-        &assert_query(db.execute_sql("SELECT COUNT(*) FROM alerts").unwrap(), "3.16-check")[0],
+        &assert_query(
+            db.execute_sql("SELECT COUNT(*) FROM alerts").unwrap(),
+            "3.16-check",
+        )[0],
         "count",
     );
     assert_eq!(remaining, 4, "expected 4 alerts remaining");
@@ -386,7 +495,10 @@ fn panopticon_schema_test() {
     if gaps.is_empty() {
         println!("All query patterns passed. No compatibility gaps found.");
     } else {
-        println!("{} compatibility gap(s) found — see PANOPTICON_COMPAT.md:", gaps.len());
+        println!(
+            "{} compatibility gap(s) found — see PANOPTICON_COMPAT.md:",
+            gaps.len()
+        );
         for (label, msg) in &gaps {
             println!("  [{}] {}", label, msg);
         }

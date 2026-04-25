@@ -35,8 +35,18 @@ fn setup_txn(seed: u64, fault_config: FaultConfig) -> MessageBus {
     let mut bus = MessageBus::new(seed, injector, &cfg);
 
     bus.register(Box::new(SimDisk::new(DISK_ID, false, &cfg)));
-    bus.register(Box::new(WalWriter::new(WAL_WRITER_ID, DISK_ID, TXN_MGR_ID, &cfg)));
-    bus.register(Box::new(WalReader::new(WAL_READER_ID, DISK_ID, CLIENT_ID, &cfg)));
+    bus.register(Box::new(WalWriter::new(
+        WAL_WRITER_ID,
+        DISK_ID,
+        TXN_MGR_ID,
+        &cfg,
+    )));
+    bus.register(Box::new(WalReader::new(
+        WAL_READER_ID,
+        DISK_ID,
+        CLIENT_ID,
+        &cfg,
+    )));
     bus.register(Box::new(TransactionManager::new(TXN_MGR_ID, WAL_WRITER_ID)));
     bus.register(Box::new(Collector::new(CLIENT_ID)));
     bus.register(Box::new(Collector::new(CLIENT2_ID)));
@@ -85,7 +95,12 @@ fn txn_begin_and_commit_empty() {
     bus.run(100);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    assert!(client.received.iter().any(|m| matches!(m, Message::TxnCommitOk { .. })));
+    assert!(
+        client
+            .received
+            .iter()
+            .any(|m| matches!(m, Message::TxnCommitOk { .. }))
+    );
 }
 
 #[test]
@@ -140,7 +155,12 @@ fn txn_put_get_commit() {
     bus.run(100);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    assert!(client.received.iter().any(|m| matches!(m, Message::TxnCommitOk { .. })));
+    assert!(
+        client
+            .received
+            .iter()
+            .any(|m| matches!(m, Message::TxnCommitOk { .. }))
+    );
 
     // New transaction should see the committed value.
     bus.send(CLIENT_ID, TXN_MGR_ID, Message::TxnBegin, 0);
@@ -222,12 +242,7 @@ fn snapshot_isolation_reads_consistent_state() {
         },
         0,
     );
-    bus.send(
-        CLIENT2_ID,
-        TXN_MGR_ID,
-        Message::TxnCommit { txn_id: t3 },
-        0,
-    );
+    bus.send(CLIENT2_ID, TXN_MGR_ID, Message::TxnCommit { txn_id: t3 }, 0);
     bus.run(200);
 
     // T2 should still see v1 (its snapshot is before T3's commit).
@@ -334,12 +349,7 @@ fn write_write_conflict_detected() {
     );
 
     // T2 commits second — should fail (write-write conflict).
-    bus.send(
-        CLIENT2_ID,
-        TXN_MGR_ID,
-        Message::TxnCommit { txn_id: t2 },
-        0,
-    );
+    bus.send(CLIENT2_ID, TXN_MGR_ID, Message::TxnCommit { txn_id: t2 }, 0);
     bus.run(200);
 
     let client2 = bus.actor::<Collector>(CLIENT2_ID).unwrap();
@@ -398,25 +408,24 @@ fn no_conflict_on_different_keys() {
     bus.run(100);
 
     bus.send(CLIENT_ID, TXN_MGR_ID, Message::TxnCommit { txn_id: t1 }, 0);
-    bus.send(
-        CLIENT2_ID,
-        TXN_MGR_ID,
-        Message::TxnCommit { txn_id: t2 },
-        0,
-    );
+    bus.send(CLIENT2_ID, TXN_MGR_ID, Message::TxnCommit { txn_id: t2 }, 0);
     bus.run(200);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    assert!(client
-        .received
-        .iter()
-        .any(|m| matches!(m, Message::TxnCommitOk { txn_id } if *txn_id == t1)));
+    assert!(
+        client
+            .received
+            .iter()
+            .any(|m| matches!(m, Message::TxnCommitOk { txn_id } if *txn_id == t1))
+    );
 
     let client2 = bus.actor::<Collector>(CLIENT2_ID).unwrap();
-    assert!(client2
-        .received
-        .iter()
-        .any(|m| matches!(m, Message::TxnCommitOk { txn_id } if *txn_id == t2)));
+    assert!(
+        client2
+            .received
+            .iter()
+            .any(|m| matches!(m, Message::TxnCommitOk { txn_id } if *txn_id == t2))
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -464,12 +473,7 @@ fn commit_ordering_first_committer_wins() {
     bus.run(200);
 
     // T2 tries to commit — conflict.
-    bus.send(
-        CLIENT2_ID,
-        TXN_MGR_ID,
-        Message::TxnCommit { txn_id: t2 },
-        0,
-    );
+    bus.send(CLIENT2_ID, TXN_MGR_ID, Message::TxnCommit { txn_id: t2 }, 0);
     bus.run(200);
 
     // Verify T1's value won.
@@ -550,10 +554,12 @@ fn abort_rollback_restores_state() {
     bus.run(200);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    assert!(client
-        .received
-        .iter()
-        .any(|m| matches!(m, Message::TxnAbortOk { .. })));
+    assert!(
+        client
+            .received
+            .iter()
+            .any(|m| matches!(m, Message::TxnAbortOk { .. }))
+    );
 
     // T3: read should see original value.
     bus.send(CLIENT_ID, TXN_MGR_ID, Message::TxnBegin, 0);
@@ -763,7 +769,10 @@ fn crash_recovery_via_wal_replay() {
         _ => panic!("Expected WAL records"),
     };
 
-    assert!(records.len() >= 2, "Should have at least 2 WAL records (2 commits)");
+    assert!(
+        records.len() >= 2,
+        "Should have at least 2 WAL records (2 commits)"
+    );
 
     // "Crash" — create fresh TransactionManager and replay WAL.
     let mut fresh_mgr = TransactionManager::new(TXN_MGR_ID, WAL_WRITER_ID);
@@ -786,10 +795,7 @@ fn crash_recovery_via_wal_replay() {
         bus2.send(
             CLIENT_ID,
             TXN_MGR_ID,
-            Message::TxnGet {
-                txn_id: t3,
-                key,
-            },
+            Message::TxnGet { txn_id: t3, key },
             0,
         );
     }
@@ -839,7 +845,12 @@ fn randomized_concurrent_transactions() {
         let mut bus = MessageBus::new(seed, injector, &cfg);
 
         bus.register(Box::new(SimDisk::new(DISK_ID, false, &cfg)));
-        bus.register(Box::new(WalWriter::new(WAL_WRITER_ID, DISK_ID, TXN_MGR_ID, &cfg)));
+        bus.register(Box::new(WalWriter::new(
+            WAL_WRITER_ID,
+            DISK_ID,
+            TXN_MGR_ID,
+            &cfg,
+        )));
         bus.register(Box::new(TransactionManager::new(TXN_MGR_ID, WAL_WRITER_ID)));
 
         // Create 5 client collectors.
@@ -901,10 +912,16 @@ fn randomized_concurrent_transactions() {
         let mut aborts = 0;
         for &cid in &client_ids {
             let c = bus.actor::<Collector>(cid).unwrap();
-            if c.received.iter().any(|m| matches!(m, Message::TxnCommitOk { .. })) {
+            if c.received
+                .iter()
+                .any(|m| matches!(m, Message::TxnCommitOk { .. }))
+            {
                 commits += 1;
             }
-            if c.received.iter().any(|m| matches!(m, Message::TxnCommitErr { .. })) {
+            if c.received
+                .iter()
+                .any(|m| matches!(m, Message::TxnCommitErr { .. }))
+            {
                 aborts += 1;
             }
         }
@@ -957,19 +974,17 @@ fn randomized_concurrent_transactions() {
     );
 
     // The "shared" key should exist exactly once.
-    let shared_entries: Vec<_> = result_a
-        .iter()
-        .filter(|(k, _)| k == b"shared")
-        .collect();
-    assert_eq!(shared_entries.len(), 1, "Exactly one writer should win 'shared'");
+    let shared_entries: Vec<_> = result_a.iter().filter(|(k, _)| k == b"shared").collect();
+    assert_eq!(
+        shared_entries.len(),
+        1,
+        "Exactly one writer should win 'shared'"
+    );
 
     // Run with different seed — may produce different outcomes.
     let result_c = run_scenario(999);
     // Both are valid, but the shared key winner may differ.
-    let shared_c: Vec<_> = result_c
-        .iter()
-        .filter(|(k, _)| k == b"shared")
-        .collect();
+    let shared_c: Vec<_> = result_c.iter().filter(|(k, _)| k == b"shared").collect();
     assert_eq!(shared_c.len(), 1, "Exactly one winner for shared key");
 }
 

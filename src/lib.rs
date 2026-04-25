@@ -5,8 +5,6 @@ pub mod engine;
 pub mod net;
 #[cfg(feature = "python")]
 pub mod python;
-#[cfg(feature = "server")]
-pub mod web;
 pub mod query;
 pub mod raft;
 pub mod sim;
@@ -14,3 +12,5 @@ pub mod storage;
 pub mod traits;
 pub mod txn;
 pub mod wal;
+#[cfg(feature = "server")]
+pub mod web;

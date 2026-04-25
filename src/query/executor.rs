@@ -21,19 +21,28 @@ pub fn execute(plan: &LogicalPlan, input: Vec<Row>) -> Vec<Row> {
             input
         }
 
-        LogicalPlan::Filter { input: child, predicate } => {
+        LogicalPlan::Filter {
+            input: child,
+            predicate,
+        } => {
             let rows = execute(child, input);
-            rows.into_iter().filter(|row| predicate.is_true(row)).collect()
+            rows.into_iter()
+                .filter(|row| predicate.is_true(row))
+                .collect()
         }
 
-        LogicalPlan::Project { input: child, columns } => {
+        LogicalPlan::Project {
+            input: child,
+            columns,
+        } => {
             let rows = execute(child, input);
             rows.into_iter()
                 .map(|row| {
                     let mut projected = BTreeMap::new();
                     for col in columns {
                         // Try qualified name; fall back to unqualified (strip table prefix).
-                        let val = row.get(col)
+                        let val = row
+                            .get(col)
                             .or_else(|| col.rfind('.').and_then(|p| row.get(&col[p + 1..])))
                             .cloned()
                             .unwrap_or(Value::Null);
@@ -49,8 +58,14 @@ pub fn execute(plan: &LogicalPlan, input: Vec<Row>) -> Vec<Row> {
             rows.sort_by(|a, b| {
                 for (col, order) in keys {
                     let unq = col.rfind('.').map(|p| &col[p + 1..]);
-                    let av = a.get(col).or_else(|| unq.and_then(|u| a.get(u))).unwrap_or(&Value::Null);
-                    let bv = b.get(col).or_else(|| unq.and_then(|u| b.get(u))).unwrap_or(&Value::Null);
+                    let av = a
+                        .get(col)
+                        .or_else(|| unq.and_then(|u| a.get(u)))
+                        .unwrap_or(&Value::Null);
+                    let bv = b
+                        .get(col)
+                        .or_else(|| unq.and_then(|u| b.get(u)))
+                        .unwrap_or(&Value::Null);
                     let cmp = value_cmp(av, bv);
                     let cmp = if matches!(order, SortOrder::Desc) {
                         cmp.reverse()
@@ -149,6 +164,20 @@ pub fn execute(plan: &LogicalPlan, input: Vec<Row>) -> Vec<Row> {
             // Join requires execute_with_sources; fall through with input.
             input
         }
+
+        LogicalPlan::Extend {
+            input: child,
+            computed,
+        } => {
+            let mut rows = execute(child, input);
+            for row in rows.iter_mut() {
+                for (name, expr) in computed {
+                    let v = expr.eval(row);
+                    row.insert(name.clone(), v);
+                }
+            }
+            rows
+        }
     }
 }
 
@@ -158,9 +187,7 @@ pub fn execute(plan: &LogicalPlan, input: Vec<Row>) -> Vec<Row> {
 /// Row keys in sources should already be prefixed with `tablename.colname`.
 pub fn execute_with_sources(plan: &LogicalPlan, sources: &BTreeMap<String, Vec<Row>>) -> Vec<Row> {
     match plan {
-        LogicalPlan::Scan { schema } => {
-            sources.get(&schema.table).cloned().unwrap_or_default()
-        }
+        LogicalPlan::Scan { schema } => sources.get(&schema.table).cloned().unwrap_or_default(),
 
         LogicalPlan::IndexScan { schema, .. } => {
             sources.get(&schema.table).cloned().unwrap_or_default()
@@ -168,7 +195,9 @@ pub fn execute_with_sources(plan: &LogicalPlan, sources: &BTreeMap<String, Vec<R
 
         LogicalPlan::Filter { input, predicate } => {
             let rows = execute_with_sources(input, sources);
-            rows.into_iter().filter(|row| predicate.is_true(row)).collect()
+            rows.into_iter()
+                .filter(|row| predicate.is_true(row))
+                .collect()
         }
 
         LogicalPlan::Project { input, columns } => {
@@ -278,9 +307,11 @@ pub fn execute_with_sources(plan: &LogicalPlan, sources: &BTreeMap<String, Vec<R
             let right_cols: Vec<String> = if let Some(first) = right_rows.first() {
                 first.keys().cloned().collect()
             } else if let Some(schema) = right.root_schema() {
-                schema.columns.iter().map(|c| {
-                    format!("{}.{}", schema.table, c.name)
-                }).collect()
+                schema
+                    .columns
+                    .iter()
+                    .map(|c| format!("{}.{}", schema.table, c.name))
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -288,9 +319,11 @@ pub fn execute_with_sources(plan: &LogicalPlan, sources: &BTreeMap<String, Vec<R
             let left_cols: Vec<String> = if let Some(first) = left_rows.first() {
                 first.keys().cloned().collect()
             } else if let Some(schema) = left.root_schema() {
-                schema.columns.iter().map(|c| {
-                    format!("{}.{}", schema.table, c.name)
-                }).collect()
+                schema
+                    .columns
+                    .iter()
+                    .map(|c| format!("{}.{}", schema.table, c.name))
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -357,7 +390,7 @@ pub fn execute_with_sources(plan: &LogicalPlan, sources: &BTreeMap<String, Vec<R
                     }
                     result
                 }
-                JoinType::Right  => {
+                JoinType::Right => {
                     let mut result = Vec::new();
                     for r in &right_rows {
                         let mut matched = false;
@@ -406,6 +439,17 @@ pub fn execute_with_sources(plan: &LogicalPlan, sources: &BTreeMap<String, Vec<R
             let rows = execute_with_sources(input, sources);
             rows.into_iter().skip(*n).collect()
         }
+
+        LogicalPlan::Extend { input, computed } => {
+            let mut rows = execute_with_sources(input, sources);
+            for row in rows.iter_mut() {
+                for (name, expr) in computed {
+                    let v = expr.eval(row);
+                    row.insert(name.clone(), v);
+                }
+            }
+            rows
+        }
     }
 }
 
@@ -435,23 +479,21 @@ fn apply_agg(func: &AggFunc, rows: &[Row]) -> Value {
             }
         }
 
-        AggFunc::Min(col) => {
-            rows.iter()
-                .filter_map(|r| r.get(col))
-                .filter(|v| !v.is_null())
-                .min_by(|a, b| value_cmp(a, b))
-                .cloned()
-                .unwrap_or(Value::Null)
-        }
+        AggFunc::Min(col) => rows
+            .iter()
+            .filter_map(|r| r.get(col))
+            .filter(|v| !v.is_null())
+            .min_by(|a, b| value_cmp(a, b))
+            .cloned()
+            .unwrap_or(Value::Null),
 
-        AggFunc::Max(col) => {
-            rows.iter()
-                .filter_map(|r| r.get(col))
-                .filter(|v| !v.is_null())
-                .max_by(|a, b| value_cmp(a, b))
-                .cloned()
-                .unwrap_or(Value::Null)
-        }
+        AggFunc::Max(col) => rows
+            .iter()
+            .filter_map(|r| r.get(col))
+            .filter(|v| !v.is_null())
+            .max_by(|a, b| value_cmp(a, b))
+            .cloned()
+            .unwrap_or(Value::Null),
 
         AggFunc::Avg(col) => {
             let mut sum = 0.0f64;
@@ -487,8 +529,12 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (_, Null) => std::cmp::Ordering::Greater,
         (Int64(x), Int64(y)) => x.cmp(y),
         (Float64(x), Float64(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
-        (Int64(x), Float64(y)) => (*x as f64).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
-        (Float64(x), Int64(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(std::cmp::Ordering::Equal),
+        (Int64(x), Float64(y)) => (*x as f64)
+            .partial_cmp(y)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Float64(x), Int64(y)) => x
+            .partial_cmp(&(*y as f64))
+            .unwrap_or(std::cmp::Ordering::Equal),
         (Text(x), Text(y)) => x.cmp(y),
         (Bool(x), Bool(y)) => x.cmp(y),
         (Bytes(x), Bytes(y)) => x.cmp(y),
@@ -518,6 +564,7 @@ fn type_tag(v: &Value) -> u8 {
         Value::Date(_) => 7,
         Value::Uuid(_) => 8,
         Value::Decimal(_, _) => 9,
+        Value::Vector(_) => 10,
     }
 }
 

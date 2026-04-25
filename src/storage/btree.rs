@@ -171,27 +171,21 @@ impl BTreeEngine {
         results
             .into_iter()
             .filter(|(k, _)| {
-                if let Some(s) = start {
-                    if k.as_slice() < s {
+                if let Some(s) = start
+                    && k.as_slice() < s {
                         return false;
                     }
-                }
-                if let Some(e) = end {
-                    if k.as_slice() >= e {
+                if let Some(e) = end
+                    && k.as_slice() >= e {
                         return false;
                     }
-                }
                 true
             })
             .collect()
     }
 
     /// Recursively collect all key-value pairs from leaf nodes in order.
-    fn collect_leaves(
-        &self,
-        page_id: Option<PageId>,
-        results: &mut Vec<(Vec<u8>, Vec<u8>)>,
-    ) {
+    fn collect_leaves(&self, page_id: Option<PageId>, results: &mut Vec<(Vec<u8>, Vec<u8>)>) {
         let Some(pid) = page_id else { return };
         let Some(node) = self.nodes.get(&pid) else {
             return;
@@ -339,11 +333,10 @@ impl BTreeEngine {
     /// Find the parent of a given page. Returns None if the page is the root.
     fn find_parent(&self, child_id: PageId) -> Option<PageId> {
         for (pid, node) in &self.nodes {
-            if let BTreeNode::Internal { children, .. } = node {
-                if children.contains(&child_id) {
+            if let BTreeNode::Internal { children, .. } = node
+                && children.contains(&child_id) {
                     return Some(*pid);
                 }
-            }
         }
         None
     }
@@ -404,8 +397,7 @@ impl BTreeEngine {
 
         match op {
             WAL_OP_PUT => {
-                let val_len =
-                    u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
+                let val_len = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
                 pos += 4;
                 let value = data.get(pos..pos + val_len)?.to_vec();
                 Some((op, key, Some(value)))
@@ -524,10 +516,7 @@ impl StateMachine for BTreeEngine {
             }
 
             Message::BTreeScan { start, end } => {
-                let entries = self.scan(
-                    start.as_deref(),
-                    end.as_deref(),
-                );
+                let entries = self.scan(start.as_deref(), end.as_deref());
                 Some(vec![(
                     Message::BTreeScanResult { entries },
                     Destination {

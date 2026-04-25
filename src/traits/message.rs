@@ -29,9 +29,7 @@ pub struct Envelope {
 
 impl PartialEq for Envelope {
     fn eq(&self, other: &Self) -> bool {
-        self.deliver_at == other.deliver_at
-            && self.from == other.from
-            && self.to == other.to
+        self.deliver_at == other.deliver_at && self.from == other.from && self.to == other.to
     }
 }
 
@@ -65,21 +63,31 @@ pub enum Message {
 
     // --- WAL messages ---
     /// Request to append a record to the WAL.
-    WalAppend { data: Vec<u8> },
+    WalAppend {
+        data: Vec<u8>,
+    },
     /// WAL append succeeded; returns the LSN of the written record.
-    WalAppendOk { lsn: u64 },
+    WalAppendOk {
+        lsn: u64,
+    },
     /// WAL append failed.
-    WalAppendErr { reason: String },
+    WalAppendErr {
+        reason: String,
+    },
     /// Request to read all records from the WAL (recovery).
     WalReadAll,
     /// Response containing all recovered WAL records.
-    WalRecords { records: Vec<(u64, Vec<u8>)> },
+    WalRecords {
+        records: Vec<(u64, Vec<u8>)>,
+    },
     /// Request to fsync the WAL.
     WalFsync,
     /// Fsync completed.
     WalFsyncOk,
     /// Fsync failed.
-    WalFsyncErr { reason: String },
+    WalFsyncErr {
+        reason: String,
+    },
 
     // --- IO messages (between state machines and simulated IO) ---
     /// Write bytes to a file at an offset.
@@ -89,7 +97,10 @@ pub enum Message {
         data: Vec<u8>,
     },
     /// Disk write completed.
-    DiskWriteOk { file_id: u64, offset: u64 },
+    DiskWriteOk {
+        file_id: u64,
+        offset: u64,
+    },
     /// Disk write failed.
     DiskWriteErr {
         file_id: u64,
@@ -115,113 +126,227 @@ pub enum Message {
         reason: String,
     },
     /// Fsync a file.
-    DiskFsync { file_id: u64 },
+    DiskFsync {
+        file_id: u64,
+    },
     /// Disk fsync completed.
-    DiskFsyncOk { file_id: u64 },
+    DiskFsyncOk {
+        file_id: u64,
+    },
     /// Disk fsync failed.
-    DiskFsyncErr { file_id: u64, reason: String },
+    DiskFsyncErr {
+        file_id: u64,
+        reason: String,
+    },
 
     // --- Buffer pool messages ---
     /// Write a page to the buffer pool.
-    BufPoolWritePage { page_id: u64, data: Vec<u8> },
+    BufPoolWritePage {
+        page_id: u64,
+        data: Vec<u8>,
+    },
     /// Page write acknowledged.
-    BufPoolWriteOk { page_id: u64 },
+    BufPoolWriteOk {
+        page_id: u64,
+    },
     /// Read a page from the buffer pool.
-    BufPoolReadPage { page_id: u64 },
+    BufPoolReadPage {
+        page_id: u64,
+    },
     /// Page data returned from the buffer pool.
-    BufPoolPageData { page_id: u64, data: Vec<u8> },
+    BufPoolPageData {
+        page_id: u64,
+        data: Vec<u8>,
+    },
     /// Page not found in buffer pool or on disk.
-    BufPoolPageNotFound { page_id: u64 },
+    BufPoolPageNotFound {
+        page_id: u64,
+    },
     /// Flush all dirty pages to disk.
     BufPoolFlush,
     /// Flush completed.
     BufPoolFlushOk,
     /// Flush failed.
-    BufPoolFlushErr { reason: String },
+    BufPoolFlushErr {
+        reason: String,
+    },
 
     // --- B-tree client interface ---
     /// Get a value by key.
-    BTreeGet { key: Vec<u8> },
+    BTreeGet {
+        key: Vec<u8>,
+    },
     /// Get result.
-    BTreeGetResult { key: Vec<u8>, value: Option<Vec<u8>> },
+    BTreeGetResult {
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    },
     /// Insert or update a key-value pair.
-    BTreePut { key: Vec<u8>, value: Vec<u8> },
+    BTreePut {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
     /// Put succeeded.
     BTreePutOk,
     /// Delete a key.
-    BTreeDelete { key: Vec<u8> },
+    BTreeDelete {
+        key: Vec<u8>,
+    },
     /// Delete result.
-    BTreeDeleteOk { found: bool },
+    BTreeDeleteOk {
+        found: bool,
+    },
     /// Scan a range of keys. None means unbounded on that side.
-    BTreeScan { start: Option<Vec<u8>>, end: Option<Vec<u8>> },
+    BTreeScan {
+        start: Option<Vec<u8>>,
+        end: Option<Vec<u8>>,
+    },
     /// Scan results.
-    BTreeScanResult { entries: Vec<(Vec<u8>, Vec<u8>)> },
+    BTreeScanResult {
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    },
 
     // --- Transaction messages ---
     /// Begin a new transaction.
     TxnBegin,
     /// Transaction begun; returns the assigned transaction ID.
-    TxnBeginOk { txn_id: u64 },
+    TxnBeginOk {
+        txn_id: u64,
+    },
     /// Read a key within a transaction.
-    TxnGet { txn_id: u64, key: Vec<u8> },
+    TxnGet {
+        txn_id: u64,
+        key: Vec<u8>,
+    },
     /// Transaction read result.
-    TxnGetResult { txn_id: u64, key: Vec<u8>, value: Option<Vec<u8>> },
+    TxnGetResult {
+        txn_id: u64,
+        key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    },
     /// Write a key-value pair within a transaction (buffered until commit).
-    TxnPut { txn_id: u64, key: Vec<u8>, value: Vec<u8> },
+    TxnPut {
+        txn_id: u64,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
     /// Transaction write buffered.
-    TxnPutOk { txn_id: u64 },
+    TxnPutOk {
+        txn_id: u64,
+    },
     /// Delete a key within a transaction (buffered until commit).
-    TxnDelete { txn_id: u64, key: Vec<u8> },
+    TxnDelete {
+        txn_id: u64,
+        key: Vec<u8>,
+    },
     /// Transaction delete buffered.
-    TxnDeleteOk { txn_id: u64 },
+    TxnDeleteOk {
+        txn_id: u64,
+    },
     /// Commit a transaction (OCC validation + apply).
-    TxnCommit { txn_id: u64 },
+    TxnCommit {
+        txn_id: u64,
+    },
     /// Transaction committed successfully.
-    TxnCommitOk { txn_id: u64 },
+    TxnCommitOk {
+        txn_id: u64,
+    },
     /// Transaction commit failed (conflict or error).
-    TxnCommitErr { txn_id: u64, reason: String },
+    TxnCommitErr {
+        txn_id: u64,
+        reason: String,
+    },
     /// Abort a transaction (discard write set).
-    TxnAbort { txn_id: u64 },
+    TxnAbort {
+        txn_id: u64,
+    },
     /// Transaction aborted.
-    TxnAbortOk { txn_id: u64 },
+    TxnAbortOk {
+        txn_id: u64,
+    },
     /// Scan a range within a transaction (snapshot read).
-    TxnScan { txn_id: u64, start: Option<Vec<u8>>, end: Option<Vec<u8>> },
+    TxnScan {
+        txn_id: u64,
+        start: Option<Vec<u8>>,
+        end: Option<Vec<u8>>,
+    },
     /// Transaction scan result.
-    TxnScanResult { txn_id: u64, entries: Vec<(Vec<u8>, Vec<u8>)> },
+    TxnScanResult {
+        txn_id: u64,
+        entries: Vec<(Vec<u8>, Vec<u8>)>,
+    },
 
     // --- Backup messages ---
     /// Initiate a backup. BackupManager coordinates flush → fsync → capture.
     BackupCreate,
     /// Backup completed; contains the checkpoint.
-    BackupCreated { checkpoint_id: u64 },
+    BackupCreated {
+        checkpoint_id: u64,
+    },
     /// Restore from a previously captured checkpoint.
-    BackupRestore { checkpoint_id: u64 },
+    BackupRestore {
+        checkpoint_id: u64,
+    },
     /// Restore completed.
     BackupRestored,
     /// Backup or restore failed.
-    BackupErr { reason: String },
+    BackupErr {
+        reason: String,
+    },
     /// Internal: BackupManager requests full file data from disk.
-    BackupReadDisk { file_id: u64 },
+    BackupReadDisk {
+        file_id: u64,
+    },
 
     // --- Network messages ---
     /// Send data to another node.
-    NetSend { conn_id: u64, to_node: String, data: Vec<u8> },
+    NetSend {
+        conn_id: u64,
+        to_node: String,
+        data: Vec<u8>,
+    },
     /// NetSend acknowledged.
-    NetSendOk { conn_id: u64, to_node: String },
+    NetSendOk {
+        conn_id: u64,
+        to_node: String,
+    },
     /// NetSend failed.
-    NetSendErr { conn_id: u64, to_node: String, reason: String },
+    NetSendErr {
+        conn_id: u64,
+        to_node: String,
+        reason: String,
+    },
     /// Data received from another node.
-    NetRecv { conn_id: u64, from_node: String, data: Vec<u8> },
+    NetRecv {
+        conn_id: u64,
+        from_node: String,
+        data: Vec<u8>,
+    },
     /// Request a connection to a node.
-    NetConnect { conn_id: u64, node: String },
+    NetConnect {
+        conn_id: u64,
+        node: String,
+    },
     /// Connection established.
-    NetConnected { conn_id: u64, node: String },
+    NetConnected {
+        conn_id: u64,
+        node: String,
+    },
     /// Connection lost or refused.
-    NetDisconnected { conn_id: u64, node: String },
+    NetDisconnected {
+        conn_id: u64,
+        node: String,
+    },
     /// Inject a partition between two nodes (simulation control).
-    NetPartition { node_a: String, node_b: String },
+    NetPartition {
+        node_a: String,
+        node_b: String,
+    },
     /// Heal a partition between two nodes (simulation control).
-    NetHeal { node_a: String, node_b: String },
+    NetHeal {
+        node_a: String,
+        node_b: String,
+    },
 
     // --- Raft: Leader Election ---
     RaftRequestVote {
@@ -230,8 +355,14 @@ pub enum Message {
         last_log_index: u64,
         last_log_term: u64,
     },
-    RaftVoteGranted { term: u64, from: String },
-    RaftVoteDenied  { term: u64, from: String },
+    RaftVoteGranted {
+        term: u64,
+        from: String,
+    },
+    RaftVoteDenied {
+        term: u64,
+        from: String,
+    },
 
     // --- Raft: Log Replication (also heartbeat when entries is empty) ---
     RaftAppendEntries {
@@ -243,8 +374,16 @@ pub enum Message {
         entries: Vec<(u64, Vec<u8>)>,
         leader_commit: u64,
     },
-    RaftAppendEntriesOk  { term: u64, from: String, match_index: u64 },
-    RaftAppendEntriesErr { term: u64, from: String, reason: String },
+    RaftAppendEntriesOk {
+        term: u64,
+        from: String,
+        match_index: u64,
+    },
+    RaftAppendEntriesErr {
+        term: u64,
+        from: String,
+        reason: String,
+    },
 
     // --- Raft: Snapshot Install ---
     RaftInstallSnapshot {
@@ -255,15 +394,26 @@ pub enum Message {
         /// Encoded Checkpoint bytes.
         data: Vec<u8>,
     },
-    RaftInstallSnapshotOk { term: u64, from: String },
+    RaftInstallSnapshotOk {
+        term: u64,
+        from: String,
+    },
 
     // --- Raft: Client-facing ---
     /// Leader notifies client that a command reached consensus.
-    RaftCommandCommitted { client_seq: u64, result: Vec<u8> },
+    RaftCommandCommitted {
+        client_seq: u64,
+        result: Vec<u8>,
+    },
     /// Non-leader redirects client to current leader.
-    RaftRedirect { leader_id: Option<String> },
+    RaftRedirect {
+        leader_id: Option<String>,
+    },
 
     // --- Raft: Internal ---
     /// RaftServer → local TransactionManager: apply committed command.
-    RaftApplyCommand { index: u64, data: Vec<u8> },
+    RaftApplyCommand {
+        index: u64,
+        data: Vec<u8>,
+    },
 }

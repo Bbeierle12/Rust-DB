@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use rust_dst_db::net::pgwire_adapter::{poll_external, ClientRequest, ClientResponse};
+use rust_dst_db::net::pgwire_adapter::{ClientRequest, ClientResponse, poll_external};
 use rust_dst_db::query::expr::{Column, Row, Schema, Value, ValueType};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

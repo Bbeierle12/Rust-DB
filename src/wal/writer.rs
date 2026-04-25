@@ -1,11 +1,11 @@
+//! WAL record format (on disk):
+//!   length: u32 (payload length, not including header)
+//!   crc32:  u32 (checksum of payload only)
+//!   payload: [u8; length]
+
 use crate::config::DatabaseConfig;
 use crate::traits::message::{ActorId, Destination, Message};
 use crate::traits::state_machine::StateMachine;
-
-/// WAL record format (on disk):
-///   length: u32 (payload length, not including header)
-///   crc32:  u32 (checksum of payload only)
-///   payload: [u8; length]
 
 /// WAL writer state machine.
 ///
@@ -76,8 +76,6 @@ impl StateMachine for WalWriter {
     }
 
     fn receive(&mut self, _from: ActorId, msg: Message) -> Option<Vec<(Message, Destination)>> {
-        // Alias so we can use `_from` in handlers.
-        let _from = _from;
         match msg {
             Message::WalAppend { data } => {
                 let lsn = self.next_lsn;

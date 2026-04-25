@@ -55,7 +55,7 @@ pub fn buggify() -> bool {
     x ^= x << 17;
 
     // ~5% probability.
-    x % 20 == 0
+    x.is_multiple_of(20)
 }
 
 /// Run a closure with BUGGIFY enabled for this thread, then restore state.

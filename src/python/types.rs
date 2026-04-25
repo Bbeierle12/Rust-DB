@@ -20,22 +20,30 @@ impl PyValue {
 
     #[staticmethod]
     fn bool_(b: bool) -> Self {
-        Self { inner: Value::Bool(b) }
+        Self {
+            inner: Value::Bool(b),
+        }
     }
 
     #[staticmethod]
     fn int(n: i64) -> Self {
-        Self { inner: Value::Int64(n) }
+        Self {
+            inner: Value::Int64(n),
+        }
     }
 
     #[staticmethod]
     fn float(f: f64) -> Self {
-        Self { inner: Value::Float64(f) }
+        Self {
+            inner: Value::Float64(f),
+        }
     }
 
     #[staticmethod]
     fn text(s: String) -> Self {
-        Self { inner: Value::Text(s) }
+        Self {
+            inner: Value::Text(s),
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -80,11 +88,16 @@ impl PyColumn {
             "text" | "string" | "str" => ValueType::Text,
             "bool" | "boolean" => ValueType::Bool,
             "bytes" => ValueType::Bytes,
-            _ => return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Unknown type: {}", type_name)
-            )),
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "Unknown type: {}",
+                    type_name
+                )));
+            }
         };
-        Ok(Self { inner: Column::new(name, col_type) })
+        Ok(Self {
+            inner: Column::new(name, col_type),
+        })
     }
 
     fn not_null(mut slf: PyRefMut<'_, Self>) -> Py<PyColumn> {
@@ -105,7 +118,9 @@ impl PySchema {
     #[new]
     fn new(table: String, columns: Vec<PyRef<'_, PyColumn>>) -> Self {
         let cols: Vec<Column> = columns.iter().map(|c| c.inner.clone()).collect();
-        Self { inner: Schema::new(table, cols) }
+        Self {
+            inner: Schema::new(table, cols),
+        }
     }
 }
 
@@ -120,53 +135,77 @@ pub struct PyExpr {
 impl PyExpr {
     #[staticmethod]
     fn col(name: String) -> Self {
-        Self { inner: Expr::col(name) }
+        Self {
+            inner: Expr::col(name),
+        }
     }
 
     #[staticmethod]
     fn lit_int(n: i64) -> Self {
-        Self { inner: Expr::lit(Value::Int64(n)) }
+        Self {
+            inner: Expr::lit(Value::Int64(n)),
+        }
     }
 
     #[staticmethod]
     fn lit_text(s: String) -> Self {
-        Self { inner: Expr::lit(Value::Text(s)) }
+        Self {
+            inner: Expr::lit(Value::Text(s)),
+        }
     }
 
     #[staticmethod]
     fn lit_bool(b: bool) -> Self {
-        Self { inner: Expr::lit(Value::Bool(b)) }
+        Self {
+            inner: Expr::lit(Value::Bool(b)),
+        }
     }
 
     fn eq(&self, other: &PyExpr) -> PyExpr {
-        PyExpr { inner: Expr::eq(self.inner.clone(), other.inner.clone()) }
+        PyExpr {
+            inner: Expr::eq(self.inner.clone(), other.inner.clone()),
+        }
     }
 
     fn gt(&self, other: &PyExpr) -> PyExpr {
-        PyExpr { inner: Expr::gt(self.inner.clone(), other.inner.clone()) }
+        PyExpr {
+            inner: Expr::gt(self.inner.clone(), other.inner.clone()),
+        }
     }
 
     fn lt(&self, other: &PyExpr) -> PyExpr {
-        PyExpr { inner: Expr::lt(self.inner.clone(), other.inner.clone()) }
+        PyExpr {
+            inner: Expr::lt(self.inner.clone(), other.inner.clone()),
+        }
     }
 
     fn ge(&self, other: &PyExpr) -> PyExpr {
-        PyExpr { inner: Expr::ge(self.inner.clone(), other.inner.clone()) }
+        PyExpr {
+            inner: Expr::ge(self.inner.clone(), other.inner.clone()),
+        }
     }
 
     fn le(&self, other: &PyExpr) -> PyExpr {
-        PyExpr { inner: Expr::le(self.inner.clone(), other.inner.clone()) }
+        PyExpr {
+            inner: Expr::le(self.inner.clone(), other.inner.clone()),
+        }
     }
 
     fn ne(&self, other: &PyExpr) -> PyExpr {
-        PyExpr { inner: Expr::ne(self.inner.clone(), other.inner.clone()) }
+        PyExpr {
+            inner: Expr::ne(self.inner.clone(), other.inner.clone()),
+        }
     }
 
     fn and_(&self, other: &PyExpr) -> PyExpr {
-        PyExpr { inner: Expr::and(self.inner.clone(), other.inner.clone()) }
+        PyExpr {
+            inner: Expr::and(self.inner.clone(), other.inner.clone()),
+        }
     }
 
     fn or_(&self, other: &PyExpr) -> PyExpr {
-        PyExpr { inner: Expr::or(self.inner.clone(), other.inner.clone()) }
+        PyExpr {
+            inner: Expr::or(self.inner.clone(), other.inner.clone()),
+        }
     }
 }

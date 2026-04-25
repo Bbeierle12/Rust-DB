@@ -99,8 +99,14 @@ fn different_seeds_may_differ_under_faults() {
     // (This is probabilistic but extremely unlikely to be equal.)
     // More importantly, same seed still replays identically:
     let trace_a2 = run_with_faults(111);
-    assert_eq!(trace_a, trace_a2, "Same seed must replay identically even with faults");
+    assert_eq!(
+        trace_a, trace_a2,
+        "Same seed must replay identically even with faults"
+    );
 
     // Different seeds should (almost certainly) produce different traces.
-    assert_ne!(trace_a, trace_b, "Different seeds should produce different fault patterns");
+    assert_ne!(
+        trace_a, trace_b,
+        "Different seeds should produce different fault patterns"
+    );
 }

@@ -281,9 +281,24 @@ fn bus_deterministic_delivery_order() {
     bus.register(Box::new(Collector::new(collector_id)));
 
     // Three senders, all at delay=0.
-    bus.send(ActorId(3), collector_id, Message::WalAppend { data: vec![3] }, 0);
-    bus.send(ActorId(1), collector_id, Message::WalAppend { data: vec![1] }, 0);
-    bus.send(ActorId(2), collector_id, Message::WalAppend { data: vec![2] }, 0);
+    bus.send(
+        ActorId(3),
+        collector_id,
+        Message::WalAppend { data: vec![3] },
+        0,
+    );
+    bus.send(
+        ActorId(1),
+        collector_id,
+        Message::WalAppend { data: vec![1] },
+        0,
+    );
+    bus.send(
+        ActorId(2),
+        collector_id,
+        Message::WalAppend { data: vec![2] },
+        0,
+    );
 
     bus.tick();
 
@@ -291,8 +306,16 @@ fn bus_deterministic_delivery_order() {
     assert_eq!(c.received.len(), 3);
 
     // Should be ordered by sender ActorId (1, 2, 3).
-    let data: Vec<Vec<u8>> = c.received.iter().map(|m| {
-        if let Message::WalAppend { data } = m { data.clone() } else { panic!() }
-    }).collect();
+    let data: Vec<Vec<u8>> = c
+        .received
+        .iter()
+        .map(|m| {
+            if let Message::WalAppend { data } = m {
+                data.clone()
+            } else {
+                panic!()
+            }
+        })
+        .collect();
     assert_eq!(data, vec![vec![1], vec![2], vec![3]]);
 }

@@ -50,8 +50,14 @@ fn encode_schema(schema: &Schema) -> Vec<u8> {
             ValueType::Date => 7,
             ValueType::Uuid => 8,
             ValueType::Decimal => 9,
+            ValueType::Vector { .. } => 10,
         };
         buf.push(type_tag);
+
+        // Type-specific payload.
+        if let ValueType::Vector { dim } = col.col_type {
+            buf.extend_from_slice(&dim.to_le_bytes());
+        }
 
         // Nullable.
         buf.push(col.nullable as u8);
@@ -67,7 +73,9 @@ fn decode_schema(data: &[u8]) -> Option<Schema> {
     // Table name.
     let name_len = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
     pos += 4;
-    let table = std::str::from_utf8(data.get(pos..pos + name_len)?).ok()?.to_string();
+    let table = std::str::from_utf8(data.get(pos..pos + name_len)?)
+        .ok()?
+        .to_string();
     pos += name_len;
 
     // Column count.
@@ -78,7 +86,9 @@ fn decode_schema(data: &[u8]) -> Option<Schema> {
     for _ in 0..col_count {
         let col_name_len = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
         pos += 4;
-        let col_name = std::str::from_utf8(data.get(pos..pos + col_name_len)?).ok()?.to_string();
+        let col_name = std::str::from_utf8(data.get(pos..pos + col_name_len)?)
+            .ok()?
+            .to_string();
         pos += col_name_len;
 
         let type_tag = *data.get(pos)?;
@@ -94,6 +104,11 @@ fn decode_schema(data: &[u8]) -> Option<Schema> {
             7 => ValueType::Date,
             8 => ValueType::Uuid,
             9 => ValueType::Decimal,
+            10 => {
+                let dim = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?);
+                pos += 4;
+                ValueType::Vector { dim }
+            }
             _ => return None,
         };
 
@@ -151,13 +166,17 @@ fn decode_index(data: &[u8]) -> Option<IndexDef> {
     // Name.
     let name_len = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
     pos += 4;
-    let name = std::str::from_utf8(data.get(pos..pos + name_len)?).ok()?.to_string();
+    let name = std::str::from_utf8(data.get(pos..pos + name_len)?)
+        .ok()?
+        .to_string();
     pos += name_len;
 
     // Table.
     let table_len = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
     pos += 4;
-    let table = std::str::from_utf8(data.get(pos..pos + table_len)?).ok()?.to_string();
+    let table = std::str::from_utf8(data.get(pos..pos + table_len)?)
+        .ok()?
+        .to_string();
     pos += table_len;
 
     // Column count.
@@ -168,7 +187,9 @@ fn decode_index(data: &[u8]) -> Option<IndexDef> {
     for _ in 0..col_count {
         let col_len = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
         pos += 4;
-        let col_name = std::str::from_utf8(data.get(pos..pos + col_len)?).ok()?.to_string();
+        let col_name = std::str::from_utf8(data.get(pos..pos + col_len)?)
+            .ok()?
+            .to_string();
         pos += col_len;
         columns.push(col_name);
     }
@@ -176,7 +197,12 @@ fn decode_index(data: &[u8]) -> Option<IndexDef> {
     // Unique flag.
     let unique = *data.get(pos)? != 0;
 
-    Some(IndexDef { name, table, columns, unique })
+    Some(IndexDef {
+        name,
+        table,
+        columns,
+        unique,
+    })
 }
 
 /// Public wrapper for encoding an IndexDef (used by WAL DDL records).
@@ -203,7 +229,11 @@ pub struct Catalog;
 
 impl Catalog {
     /// Register a table schema in the store.
-    pub fn create_table(store: &mut MvccStore, schema: &Schema, commit_ts: u64) -> Result<(), String> {
+    pub fn create_table(
+        store: &mut MvccStore,
+        schema: &Schema,
+        commit_ts: u64,
+    ) -> Result<(), String> {
         let key = catalog_key(&schema.table);
 
         // Check if table already exists.
@@ -240,7 +270,11 @@ impl Catalog {
     }
 
     /// Drop a table by writing a tombstone.
-    pub fn drop_table(store: &mut MvccStore, table_name: &str, commit_ts: u64) -> Result<(), String> {
+    pub fn drop_table(
+        store: &mut MvccStore,
+        table_name: &str,
+        commit_ts: u64,
+    ) -> Result<(), String> {
         let key = catalog_key(table_name);
 
         if store.read(&key, commit_ts.saturating_sub(1)).is_none() {
@@ -252,7 +286,11 @@ impl Catalog {
     }
 
     /// Register an index definition in the store.
-    pub fn create_index(store: &mut MvccStore, index: &IndexDef, commit_ts: u64) -> Result<(), String> {
+    pub fn create_index(
+        store: &mut MvccStore,
+        index: &IndexDef,
+        commit_ts: u64,
+    ) -> Result<(), String> {
         let key = index_key(&index.name);
 
         if store.read(&key, commit_ts.saturating_sub(1)).is_some() {
@@ -272,7 +310,11 @@ impl Catalog {
     }
 
     /// List all indexes for a given table.
-    pub fn list_indexes_for_table(store: &MvccStore, table_name: &str, snapshot_ts: u64) -> Vec<IndexDef> {
+    pub fn list_indexes_for_table(
+        store: &MvccStore,
+        table_name: &str,
+        snapshot_ts: u64,
+    ) -> Vec<IndexDef> {
         let start = INDEX_PREFIX.to_vec();
         let mut end = INDEX_PREFIX.to_vec();
         if let Some(last) = end.last_mut() {
@@ -288,7 +330,11 @@ impl Catalog {
     }
 
     /// Drop an index by writing a tombstone.
-    pub fn drop_index(store: &mut MvccStore, index_name: &str, commit_ts: u64) -> Result<(), String> {
+    pub fn drop_index(
+        store: &mut MvccStore,
+        index_name: &str,
+        commit_ts: u64,
+    ) -> Result<(), String> {
         let key = index_key(index_name);
 
         if store.read(&key, commit_ts.saturating_sub(1)).is_none() {
@@ -306,11 +352,14 @@ mod tests {
 
     #[test]
     fn schema_roundtrip() {
-        let schema = Schema::new("users", vec![
-            Column::new("id", ValueType::Int64).not_null(),
-            Column::new("name", ValueType::Text),
-            Column::new("active", ValueType::Bool),
-        ]);
+        let schema = Schema::new(
+            "users",
+            vec![
+                Column::new("id", ValueType::Int64).not_null(),
+                Column::new("name", ValueType::Text),
+                Column::new("active", ValueType::Bool),
+            ],
+        );
 
         let encoded = encode_schema(&schema);
         let decoded = decode_schema(&encoded).unwrap();
@@ -334,10 +383,13 @@ mod tests {
     #[test]
     fn catalog_create_and_get() {
         let mut store = MvccStore::new();
-        let schema = Schema::new("users", vec![
-            Column::new("id", ValueType::Int64).not_null(),
-            Column::new("name", ValueType::Text),
-        ]);
+        let schema = Schema::new(
+            "users",
+            vec![
+                Column::new("id", ValueType::Int64).not_null(),
+                Column::new("name", ValueType::Text),
+            ],
+        );
 
         Catalog::create_table(&mut store, &schema, 1).unwrap();
 
@@ -348,9 +400,7 @@ mod tests {
     #[test]
     fn catalog_duplicate_table_error() {
         let mut store = MvccStore::new();
-        let schema = Schema::new("users", vec![
-            Column::new("id", ValueType::Int64),
-        ]);
+        let schema = Schema::new("users", vec![Column::new("id", ValueType::Int64)]);
 
         Catalog::create_table(&mut store, &schema, 1).unwrap();
         let result = Catalog::create_table(&mut store, &schema, 2);

@@ -55,6 +55,11 @@ impl Checkpoint {
             files.insert(file_id, file_data);
         }
 
-        Some(Self { id, captured_at_tick, last_fsynced_lsn, files })
+        Some(Self {
+            id,
+            captured_at_tick,
+            last_fsynced_lsn,
+            files,
+        })
     }
 }

@@ -1,12 +1,12 @@
+//! OCC (Optimistic Concurrency Control) write-write conflict detection.
+//!
+//! At commit time, validates that no key in the transaction's write set
+//! has been written by another committed transaction since our snapshot.
+//! This implements snapshot isolation: first committer wins.
+
 use std::collections::BTreeMap;
 
 use crate::txn::mvcc::MvccStore;
-
-/// OCC (Optimistic Concurrency Control) write-write conflict detection.
-///
-/// At commit time, validates that no key in the transaction's write set
-/// has been written by another committed transaction since our snapshot.
-/// This implements snapshot isolation: first committer wins.
 
 /// Result of conflict validation.
 #[derive(Debug, PartialEq, Eq)]

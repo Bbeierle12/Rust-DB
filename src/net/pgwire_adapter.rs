@@ -24,14 +24,13 @@
 ///     ▼
 /// PostgreSQL client
 /// ```
-
 use std::fmt::Debug;
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 
 use async_trait::async_trait;
-use futures::{stream, Sink};
+use futures::{Sink, stream};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 
@@ -71,11 +70,7 @@ pub struct ClientResponse {
 /// provided snapshot, and send results back via the reply channel.
 ///
 /// Call this at the start of each bus tick to integrate external clients.
-pub fn poll_external(
-    rx: &mpsc::Receiver<ClientRequest>,
-    schema: &Schema,
-    stored_rows: &[Row],
-) {
+pub fn poll_external(rx: &mpsc::Receiver<ClientRequest>, schema: &Schema, stored_rows: &[Row]) {
     while let Ok(req) = rx.try_recv() {
         let response = handle_request(&req.sql, schema, stored_rows);
         let _ = req.reply_tx.send(response);
@@ -88,7 +83,11 @@ fn handle_request(sql: &str, schema: &Schema, rows: &[Row]) -> ClientResponse {
 
     // Transaction control statements are accepted as no-ops for the Stage 5 stub.
     if upper == "BEGIN" || upper == "COMMIT" || upper == "ROLLBACK" {
-        return ClientResponse { columns: vec![], rows: vec![], error: None };
+        return ClientResponse {
+            columns: vec![],
+            rows: vec![],
+            error: None,
+        };
     }
 
     match sql_to_plan(trimmed, schema.clone()) {
@@ -99,9 +98,17 @@ fn handle_request(sql: &str, schema: &Schema, rows: &[Row]) -> ClientResponse {
             } else {
                 result[0].keys().cloned().collect()
             };
-            ClientResponse { columns, rows: result, error: None }
+            ClientResponse {
+                columns,
+                rows: result,
+                error: None,
+            }
         }
-        Err(e) => ClientResponse { columns: vec![], rows: vec![], error: Some(e.to_string()) },
+        Err(e) => ClientResponse {
+            columns: vec![],
+            rows: vec![],
+            error: Some(e.to_string()),
+        },
     }
 }
 
@@ -141,21 +148,15 @@ impl SimpleQueryHandler for BusQueryHandler {
                 sql: query.to_string(),
                 reply_tx,
             })
-            .map_err(|e| {
-                PgWireError::IoError(std::io::Error::other(e.to_string()))
-            })?;
+            .map_err(|e| PgWireError::IoError(std::io::Error::other(e.to_string())))?;
 
-        let resp = reply_rx.recv().map_err(|e| {
-            PgWireError::IoError(std::io::Error::other(e.to_string()))
-        })?;
+        let resp = reply_rx
+            .recv()
+            .map_err(|e| PgWireError::IoError(std::io::Error::other(e.to_string())))?;
 
         if let Some(err) = resp.error {
             return Err(PgWireError::UserError(Box::new(
-                pgwire::error::ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "42000".to_string(),
-                    err,
-                ),
+                pgwire::error::ErrorInfo::new("ERROR".to_string(), "42000".to_string(), err),
             )));
         }
 
@@ -166,9 +167,7 @@ impl SimpleQueryHandler for BusQueryHandler {
         let fields: Vec<FieldInfo> = resp
             .columns
             .iter()
-            .map(|name| {
-                FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text)
-            })
+            .map(|name| FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text))
             .collect();
         let schema = Arc::new(fields);
 
@@ -204,6 +203,7 @@ fn value_to_text(v: &Value) -> String {
         Value::Date(days) => crate::query::expr::format_date(*days),
         Value::Uuid(bytes) => crate::query::expr::format_uuid(bytes),
         Value::Decimal(val, scale) => crate::query::expr::format_decimal(*val, *scale),
+        Value::Vector(v) => crate::query::expr::format_vector(v),
     }
 }
 
@@ -269,9 +269,7 @@ pub fn start_server(port: Option<u16>) -> mpsc::SyncSender<ClientRequest> {
                     let factory = Arc::new(BusHandlerFactory {
                         handler: Arc::new(BusQueryHandler::new(server_tx.clone(), conn_id)),
                     });
-                    tokio::spawn(async move {
-                        process_socket(socket, None, factory).await
-                    });
+                    tokio::spawn(async move { process_socket(socket, None, factory).await });
                 }
             }
         });

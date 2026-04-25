@@ -25,8 +25,12 @@ fn setup_bus(seed: u64, fault_config: FaultConfig, buffered_disk: bool) -> Messa
     let mut bus = MessageBus::new(seed, injector, &cfg);
 
     bus.register(Box::new(SimDisk::new(DISK_ID, buffered_disk, &cfg)));
-    bus.register(Box::new(WalWriter::new(WRITER_ID, DISK_ID, CLIENT_ID, &cfg)));
-    bus.register(Box::new(WalReader::new(READER_ID, DISK_ID, CLIENT_ID, &cfg)));
+    bus.register(Box::new(WalWriter::new(
+        WRITER_ID, DISK_ID, CLIENT_ID, &cfg,
+    )));
+    bus.register(Box::new(WalReader::new(
+        READER_ID, DISK_ID, CLIENT_ID, &cfg,
+    )));
     bus.register(Box::new(Collector::new(CLIENT_ID)));
 
     bus
@@ -39,23 +43,69 @@ fn wal_append_and_read() {
     let mut bus = setup_bus(42, FaultConfig::none(), false);
 
     // Append three records.
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"hello".to_vec() }, 0);
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"world".to_vec() }, 0);
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"rust".to_vec() }, 0);
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"hello".to_vec(),
+        },
+        0,
+    );
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"world".to_vec(),
+        },
+        0,
+    );
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"rust".to_vec(),
+        },
+        0,
+    );
     bus.run(200);
 
     // Check that we got three WalAppendOk messages.
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let ok_count = client.received.iter().filter(|m| matches!(m, Message::WalAppendOk { .. })).count();
+    let ok_count = client
+        .received
+        .iter()
+        .filter(|m| matches!(m, Message::WalAppendOk { .. }))
+        .count();
     assert_eq!(ok_count, 3, "Expected 3 WalAppendOk, got {}", ok_count);
 
     // Now read back.
     let mut bus = setup_bus(42, FaultConfig::none(), false);
 
     // Manually write the WAL file data by appending through the writer first.
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"hello".to_vec() }, 0);
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"world".to_vec() }, 0);
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"rust".to_vec() }, 0);
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"hello".to_vec(),
+        },
+        0,
+    );
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"world".to_vec(),
+        },
+        0,
+    );
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"rust".to_vec(),
+        },
+        0,
+    );
     bus.run(200);
 
     // Now read.
@@ -63,7 +113,10 @@ fn wal_append_and_read() {
     bus.run(200);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let records_msg = client.received.iter().find(|m| matches!(m, Message::WalRecords { .. }));
+    let records_msg = client
+        .received
+        .iter()
+        .find(|m| matches!(m, Message::WalRecords { .. }));
     assert!(records_msg.is_some(), "Should have received WalRecords");
 
     if let Some(Message::WalRecords { records }) = records_msg {
@@ -82,7 +135,10 @@ fn wal_empty_read() {
     bus.run(200);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let records_msg = client.received.iter().find(|m| matches!(m, Message::WalRecords { .. }));
+    let records_msg = client
+        .received
+        .iter()
+        .find(|m| matches!(m, Message::WalRecords { .. }));
     assert!(records_msg.is_some());
 
     if let Some(Message::WalRecords { records }) = records_msg {
@@ -98,7 +154,14 @@ fn wal_fsync_with_buffered_disk() {
     let mut bus = setup_bus(42, FaultConfig::none(), true);
 
     // Append a record.
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"buffered".to_vec() }, 0);
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"buffered".to_vec(),
+        },
+        0,
+    );
     bus.run(200);
 
     // Read before fsync — data should not be persisted.
@@ -106,7 +169,11 @@ fn wal_fsync_with_buffered_disk() {
     bus.run(200);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let records_msg = client.received.iter().rev().find(|m| matches!(m, Message::WalRecords { .. }));
+    let records_msg = client
+        .received
+        .iter()
+        .rev()
+        .find(|m| matches!(m, Message::WalRecords { .. }));
     if let Some(Message::WalRecords { records }) = records_msg {
         assert!(records.is_empty(), "Unfsynced data should not be readable");
     }
@@ -120,7 +187,11 @@ fn wal_fsync_with_buffered_disk() {
     bus.run(200);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let records_msg = client.received.iter().rev().find(|m| matches!(m, Message::WalRecords { .. }));
+    let records_msg = client
+        .received
+        .iter()
+        .rev()
+        .find(|m| matches!(m, Message::WalRecords { .. }));
     if let Some(Message::WalRecords { records }) = records_msg {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].1, b"buffered".to_vec());
@@ -137,15 +208,36 @@ fn wal_recovery_after_crash_to_last_fsynced() {
     let mut bus = setup_bus(42, FaultConfig::none(), true);
 
     // Write two records and fsync.
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"rec1".to_vec() }, 0);
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"rec2".to_vec() }, 0);
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"rec1".to_vec(),
+        },
+        0,
+    );
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"rec2".to_vec(),
+        },
+        0,
+    );
     bus.run(200);
 
     bus.send(CLIENT_ID, WRITER_ID, Message::WalFsync, 0);
     bus.run(200);
 
     // Write a third record WITHOUT fsync.
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"rec3_lost".to_vec() }, 0);
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"rec3_lost".to_vec(),
+        },
+        0,
+    );
     bus.run(200);
 
     // Simulate crash — lose buffered writes.
@@ -157,7 +249,11 @@ fn wal_recovery_after_crash_to_last_fsynced() {
     bus.run(200);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let records_msg = client.received.iter().rev().find(|m| matches!(m, Message::WalRecords { .. }));
+    let records_msg = client
+        .received
+        .iter()
+        .rev()
+        .find(|m| matches!(m, Message::WalRecords { .. }));
     if let Some(Message::WalRecords { records }) = records_msg {
         assert_eq!(records.len(), 2, "Should recover only fsynced records");
         assert_eq!(records[0].1, b"rec1".to_vec());
@@ -175,9 +271,30 @@ fn wal_detects_checksum_corruption() {
     let mut bus = setup_bus(42, FaultConfig::none(), false);
 
     // Write three records.
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"good1".to_vec() }, 0);
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"good2".to_vec() }, 0);
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"good3".to_vec() }, 0);
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"good1".to_vec(),
+        },
+        0,
+    );
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"good2".to_vec(),
+        },
+        0,
+    );
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"good3".to_vec(),
+        },
+        0,
+    );
     bus.run(200);
 
     // Corrupt the second record by writing garbage into the middle of the file.
@@ -200,7 +317,11 @@ fn wal_detects_checksum_corruption() {
     bus.run(200);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let records_msg = client.received.iter().rev().find(|m| matches!(m, Message::WalRecords { .. }));
+    let records_msg = client
+        .received
+        .iter()
+        .rev()
+        .find(|m| matches!(m, Message::WalRecords { .. }));
     if let Some(Message::WalRecords { records }) = records_msg {
         assert_eq!(records.len(), 1, "Should truncate at corrupted record");
         assert_eq!(records[0].1, b"good1".to_vec());
@@ -220,7 +341,14 @@ fn wal_fsync_failure_reported() {
     let mut bus = setup_bus(42, config, false);
 
     // Write a record.
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"data".to_vec() }, 0);
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"data".to_vec(),
+        },
+        0,
+    );
     bus.run(200);
 
     // Request fsync — should fail due to fault injection.
@@ -228,7 +356,10 @@ fn wal_fsync_failure_reported() {
     bus.run(200);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let fsync_err = client.received.iter().any(|m| matches!(m, Message::WalFsyncErr { .. }));
+    let fsync_err = client
+        .received
+        .iter()
+        .any(|m| matches!(m, Message::WalFsyncErr { .. }));
     assert!(fsync_err, "Should have received WalFsyncErr");
 }
 
@@ -243,11 +374,21 @@ fn wal_write_failure_reported() {
     let mut bus = setup_bus(42, config, false);
 
     // Append — disk write will fail due to fault injection.
-    bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"doomed".to_vec() }, 0);
+    bus.send(
+        CLIENT_ID,
+        WRITER_ID,
+        Message::WalAppend {
+            data: b"doomed".to_vec(),
+        },
+        0,
+    );
     bus.run(200);
 
     let client = bus.actor::<Collector>(CLIENT_ID).unwrap();
-    let append_err = client.received.iter().any(|m| matches!(m, Message::WalAppendErr { .. }));
+    let append_err = client
+        .received
+        .iter()
+        .any(|m| matches!(m, Message::WalAppendErr { .. }));
     assert!(append_err, "Should have received WalAppendErr");
 }
 
@@ -258,9 +399,30 @@ fn wal_deterministic_replay() {
     fn run_wal_scenario(seed: u64) -> Vec<String> {
         let mut bus = setup_bus(seed, FaultConfig::none(), false);
 
-        bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"a".to_vec() }, 0);
-        bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"b".to_vec() }, 0);
-        bus.send(CLIENT_ID, WRITER_ID, Message::WalAppend { data: b"c".to_vec() }, 0);
+        bus.send(
+            CLIENT_ID,
+            WRITER_ID,
+            Message::WalAppend {
+                data: b"a".to_vec(),
+            },
+            0,
+        );
+        bus.send(
+            CLIENT_ID,
+            WRITER_ID,
+            Message::WalAppend {
+                data: b"b".to_vec(),
+            },
+            0,
+        );
+        bus.send(
+            CLIENT_ID,
+            WRITER_ID,
+            Message::WalAppend {
+                data: b"c".to_vec(),
+            },
+            0,
+        );
         bus.run(200);
 
         bus.send(CLIENT_ID, READER_ID, Message::WalReadAll, 0);
@@ -274,5 +436,8 @@ fn wal_deterministic_replay() {
 
     let trace_a = run_wal_scenario(777);
     let trace_b = run_wal_scenario(777);
-    assert_eq!(trace_a, trace_b, "WAL operations must replay deterministically");
+    assert_eq!(
+        trace_a, trace_b,
+        "WAL operations must replay deterministically"
+    );
 }

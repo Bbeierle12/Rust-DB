@@ -1,7 +1,6 @@
 use sqlparser::ast::{
-    BinaryOperator, Expr as SqlExpr, GroupByExpr, JoinConstraint, JoinOperator,
-    OrderByExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
-    UnaryOperator, Value as SqlValue,
+    BinaryOperator, Expr as SqlExpr, GroupByExpr, JoinConstraint, JoinOperator, OrderByExpr, Query,
+    Select, SelectItem, SetExpr, Statement, TableFactor, UnaryOperator, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -36,8 +35,8 @@ fn err(msg: impl Into<String>) -> SqlError {
 /// The schema must be provided so we can identify the table.
 pub fn sql_to_plan(sql: &str, schema: Schema) -> Result<LogicalPlan, SqlError> {
     let dialect = GenericDialect {};
-    let mut stmts = Parser::parse_sql(&dialect, sql)
-        .map_err(|e| err(format!("parse error: {}", e)))?;
+    let mut stmts =
+        Parser::parse_sql(&dialect, sql).map_err(|e| err(format!("parse error: {}", e)))?;
 
     if stmts.len() != 1 {
         return Err(err("expected exactly one statement"));
@@ -58,8 +57,8 @@ pub fn sql_to_plan_multi(
     schema_resolver: impl Fn(&str) -> Option<Schema>,
 ) -> Result<LogicalPlan, SqlError> {
     let dialect = GenericDialect {};
-    let mut stmts = Parser::parse_sql(&dialect, sql)
-        .map_err(|e| err(format!("parse error: {}", e)))?;
+    let mut stmts =
+        Parser::parse_sql(&dialect, sql).map_err(|e| err(format!("parse error: {}", e)))?;
 
     if stmts.len() != 1 {
         return Err(err("expected exactly one statement"));
@@ -131,40 +130,27 @@ fn translate_select_multi(
         return Err(err("expected at least one FROM table"));
     }
 
-    let from = &select.from[0];
+    // Each entry in `select.from` is a TableWithJoins (relation + zero or more joins).
+    // Multiple entries are produced by comma-joins (`FROM a, b`). Stitch them with
+    // CROSS JOIN per SQL semantics, then apply each entry's explicit JOINs in turn.
+    let mut from_iter = select.from.iter();
+    let first = from_iter.next().expect("non-empty checked above");
 
-    // Get the primary table name and schema.
-    let primary_table = match &from.relation {
-        TableFactor::Table { name, .. } => name.to_string(),
-        other => return Err(err(format!("unsupported FROM: {:?}", other))),
-    };
-    let primary_schema = schema_resolver(&primary_table)
-        .ok_or_else(|| err(format!("unknown table '{}'", primary_table)))?;
+    let mut plan = build_table_factor_plan(&first.relation, schema_resolver)?;
+    for join in &first.joins {
+        plan = apply_explicit_join(plan, join, schema_resolver)?;
+    }
 
-    let mut plan: LogicalPlan = LogicalPlan::Scan {
-        schema: primary_schema.clone(),
-    };
-
-    // Process JOINs from from[0].joins
-    for join in &from.joins {
-        let right_table = match &join.relation {
-            TableFactor::Table { name, .. } => name.to_string(),
-            other => return Err(err(format!("unsupported JOIN table: {:?}", other))),
-        };
-        let right_schema = schema_resolver(&right_table)
-            .ok_or_else(|| err(format!("unknown table '{}'", right_table)))?;
-
-        let right_plan = LogicalPlan::Scan {
-            schema: right_schema,
-        };
-
-        let (join_type, on_expr) = parse_join_operator(&join.join_operator)?;
-
+    for next in from_iter {
+        let mut right_plan = build_table_factor_plan(&next.relation, schema_resolver)?;
+        for join in &next.joins {
+            right_plan = apply_explicit_join(right_plan, join, schema_resolver)?;
+        }
         plan = LogicalPlan::Join {
             left: Box::new(plan),
             right: Box::new(right_plan),
-            join_type,
-            on: on_expr,
+            join_type: JoinType::Cross,
+            on: None,
         };
     }
 
@@ -177,10 +163,11 @@ fn translate_select_multi(
         };
     }
 
-    // SELECT items — detect aggregates vs projections.
+    // SELECT items — detect aggregates vs projections vs computed expressions.
     let mut projections: Vec<String> = Vec::new();
     let mut agg_funcs: Vec<(String, AggFunc)> = Vec::new();
     let mut group_by_cols: Vec<String> = Vec::new();
+    let mut computed: Vec<(String, Expr)> = Vec::new();
     let mut is_star = false;
 
     for item in &select.projection {
@@ -191,16 +178,24 @@ fn translate_select_multi(
             SelectItem::UnnamedExpr(expr) => {
                 if let Some((out_name, agg)) = try_agg_func(expr)? {
                     agg_funcs.push((out_name, agg));
-                } else {
+                } else if is_simple_column(expr) {
                     let col = expr_to_col_name_qualified(expr)?;
                     projections.push(col);
+                } else {
+                    let alias = expr_to_col_name_qualified(expr)?;
+                    let e = sql_expr_to_expr_qualified(expr)?;
+                    computed.push((alias.clone(), e));
+                    projections.push(alias);
                 }
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 if let Some((_, agg)) = try_agg_func(expr)? {
                     agg_funcs.push((alias.value.clone(), agg));
+                } else if is_simple_column(expr) {
+                    projections.push(alias.value.clone());
                 } else {
-                    let _col = expr_to_col_name_qualified(expr)?;
+                    let e = sql_expr_to_expr_qualified(expr)?;
+                    computed.push((alias.value.clone(), e));
                     projections.push(alias.value.clone());
                 }
             }
@@ -220,6 +215,13 @@ fn translate_select_multi(
         }
     }
 
+    if !computed.is_empty() {
+        plan = LogicalPlan::Extend {
+            input: Box::new(plan),
+            computed,
+        };
+    }
+
     // Apply aggregation if needed.
     if !agg_funcs.is_empty() || !group_by_cols.is_empty() {
         plan = LogicalPlan::Aggregate {
@@ -235,6 +237,45 @@ fn translate_select_multi(
     }
 
     Ok(plan)
+}
+
+/// Identify SELECT items that are pure column references (qualified or not).
+/// These bypass the Extend node since the column already exists on the row.
+fn is_simple_column(expr: &SqlExpr) -> bool {
+    matches!(
+        expr,
+        SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_)
+    )
+}
+
+/// Build a Scan plan from a single TableFactor.
+fn build_table_factor_plan(
+    factor: &TableFactor,
+    schema_resolver: &impl Fn(&str) -> Option<Schema>,
+) -> Result<LogicalPlan, SqlError> {
+    let table_name = match factor {
+        TableFactor::Table { name, .. } => name.to_string(),
+        other => return Err(err(format!("unsupported FROM: {:?}", other))),
+    };
+    let schema = schema_resolver(&table_name)
+        .ok_or_else(|| err(format!("unknown table '{}'", table_name)))?;
+    Ok(LogicalPlan::Scan { schema })
+}
+
+/// Apply an explicit JOIN clause to the running plan.
+fn apply_explicit_join(
+    left: LogicalPlan,
+    join: &sqlparser::ast::Join,
+    schema_resolver: &impl Fn(&str) -> Option<Schema>,
+) -> Result<LogicalPlan, SqlError> {
+    let right = build_table_factor_plan(&join.relation, schema_resolver)?;
+    let (join_type, on_expr) = parse_join_operator(&join.join_operator)?;
+    Ok(LogicalPlan::Join {
+        left: Box::new(left),
+        right: Box::new(right),
+        join_type,
+        on: on_expr,
+    })
 }
 
 fn parse_join_operator(op: &JoinOperator) -> Result<(JoinType, Option<Expr>), SqlError> {
@@ -271,9 +312,11 @@ fn parse_join_constraint(constraint: &JoinConstraint) -> Result<Option<Expr>, Sq
 fn expr_to_col_name_qualified(expr: &SqlExpr) -> Result<String, SqlError> {
     match expr {
         SqlExpr::Identifier(ident) => Ok(ident.value.clone()),
-        SqlExpr::CompoundIdentifier(parts) => {
-            Ok(parts.iter().map(|p| p.value.clone()).collect::<Vec<_>>().join("."))
-        }
+        SqlExpr::CompoundIdentifier(parts) => Ok(parts
+            .iter()
+            .map(|p| p.value.clone())
+            .collect::<Vec<_>>()
+            .join(".")),
         SqlExpr::Function(func) => Ok(func.name.to_string().to_uppercase()),
         other => Err(err(format!("expected column name, got: {:?}", other))),
     }
@@ -284,7 +327,11 @@ fn sql_expr_to_expr_qualified(expr: &SqlExpr) -> Result<Expr, SqlError> {
     match expr {
         SqlExpr::Identifier(ident) => Ok(Expr::col(ident.value.clone())),
         SqlExpr::CompoundIdentifier(parts) => Ok(Expr::col(
-            parts.iter().map(|p| p.value.clone()).collect::<Vec<_>>().join(".")
+            parts
+                .iter()
+                .map(|p| p.value.clone())
+                .collect::<Vec<_>>()
+                .join("."),
         )),
         SqlExpr::Value(v) => Ok(Expr::lit(sql_value_to_value(v)?)),
         SqlExpr::BinaryOp { left, op, right } => {
@@ -313,9 +360,10 @@ fn sql_expr_to_expr_qualified(expr: &SqlExpr) -> Result<Expr, SqlError> {
         SqlExpr::Function(func) => {
             let name = func.name.to_string().to_uppercase();
             match name.as_str() {
-                "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {
-                    Err(err(format!("aggregate function {} not allowed in this context", name)))
-                }
+                "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => Err(err(format!(
+                    "aggregate function {} not allowed in this context",
+                    name
+                ))),
                 _ => {
                     use sqlparser::ast::FunctionArguments;
                     let args = match &func.args {
@@ -323,35 +371,104 @@ fn sql_expr_to_expr_qualified(expr: &SqlExpr) -> Result<Expr, SqlError> {
                         FunctionArguments::Subquery(_) => {
                             return Err(err("subquery function args not supported"));
                         }
-                        FunctionArguments::List(list) => {
-                            list.args.iter().map(|arg| {
-                                match arg {
-                                    sqlparser::ast::FunctionArg::Unnamed(
-                                        sqlparser::ast::FunctionArgExpr::Expr(e)
-                                    ) => sql_expr_to_expr_qualified(e),
-                                    sqlparser::ast::FunctionArg::Unnamed(
-                                        sqlparser::ast::FunctionArgExpr::Wildcard
-                                    ) => Ok(Expr::lit(Value::Null)),
-                                    other => Err(err(format!("unsupported function arg: {:?}", other))),
-                                }
-                            }).collect::<Result<Vec<_>, _>>()?
-                        }
+                        FunctionArguments::List(list) => list
+                            .args
+                            .iter()
+                            .map(|arg| match arg {
+                                sqlparser::ast::FunctionArg::Unnamed(
+                                    sqlparser::ast::FunctionArgExpr::Expr(e),
+                                ) => sql_expr_to_expr_qualified(e),
+                                sqlparser::ast::FunctionArg::Unnamed(
+                                    sqlparser::ast::FunctionArgExpr::Wildcard,
+                                ) => Ok(Expr::lit(Value::Null)),
+                                other => Err(err(format!("unsupported function arg: {:?}", other))),
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
                     };
                     Ok(Expr::function(name, args))
                 }
             }
         }
-        SqlExpr::Like { negated, expr, pattern, .. } => {
+        SqlExpr::Like {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+            ..
+        } => {
             let val = sql_expr_to_expr_qualified(expr)?;
             let pat = sql_expr_to_expr_qualified(pattern)?;
-            let like_expr = Expr::like(val, pat);
+            let like_expr = match parse_escape_char(escape_char.as_deref())? {
+                Some(c) => Expr::like_escape(val, pat, c),
+                None => Expr::like(val, pat),
+            };
             if *negated {
                 Ok(Expr::not(like_expr))
             } else {
                 Ok(like_expr)
             }
         }
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let val = sql_expr_to_expr_qualified(expr)?;
+            let items: Vec<Expr> = list
+                .iter()
+                .map(sql_expr_to_expr_qualified)
+                .collect::<Result<_, _>>()?;
+            let in_expr = Expr::in_list(val, items);
+            if *negated {
+                Ok(Expr::not(in_expr))
+            } else {
+                Ok(in_expr)
+            }
+        }
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            let val = sql_expr_to_expr_qualified(expr)?;
+            let lo = sql_expr_to_expr_qualified(low)?;
+            let hi = sql_expr_to_expr_qualified(high)?;
+            let between_expr = Expr::between(val, lo, hi);
+            if *negated {
+                Ok(Expr::not(between_expr))
+            } else {
+                Ok(between_expr)
+            }
+        }
+        SqlExpr::IsNull(inner) => {
+            let e = sql_expr_to_expr_qualified(inner)?;
+            Ok(Expr::is_null(e))
+        }
+        SqlExpr::IsNotNull(inner) => {
+            let e = sql_expr_to_expr_qualified(inner)?;
+            Ok(Expr::is_not_null(e))
+        }
         other => Err(err(format!("unsupported expression: {:?}", other))),
+    }
+}
+
+/// Parse an `ESCAPE` clause's character. sqlparser delivers it as `Option<String>`.
+/// SQL standard: ESCAPE must be exactly one character.
+fn parse_escape_char(escape: Option<&str>) -> Result<Option<char>, SqlError> {
+    match escape {
+        None => Ok(None),
+        Some(s) => {
+            let mut chars = s.chars();
+            let first = chars.next();
+            if first.is_none() || chars.next().is_some() {
+                return Err(err(format!(
+                    "ESCAPE clause must be a single character, got '{}'",
+                    s
+                )));
+            }
+            Ok(first)
+        }
     }
 }
 
@@ -453,10 +570,11 @@ fn translate_select(select: Select, schema: Schema) -> Result<LogicalPlan, SqlEr
         };
     }
 
-    // SELECT items — detect aggregates vs projections.
+    // SELECT items — detect aggregates vs projections vs computed expressions.
     let mut projections: Vec<String> = Vec::new();
     let mut agg_funcs: Vec<(String, AggFunc)> = Vec::new();
     let mut group_by_cols: Vec<String> = Vec::new();
+    let mut computed: Vec<(String, Expr)> = Vec::new();
     let mut is_star = false;
 
     for item in &select.projection {
@@ -467,16 +585,24 @@ fn translate_select(select: Select, schema: Schema) -> Result<LogicalPlan, SqlEr
             SelectItem::UnnamedExpr(expr) => {
                 if let Some((out_name, agg)) = try_agg_func(expr)? {
                     agg_funcs.push((out_name, agg));
-                } else {
+                } else if is_simple_column(expr) {
                     let col = expr_to_col_name(expr)?;
                     projections.push(col);
+                } else {
+                    let alias = expr_to_col_name(expr)?;
+                    let e = sql_expr_to_expr(expr)?;
+                    computed.push((alias.clone(), e));
+                    projections.push(alias);
                 }
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 if let Some((_, agg)) = try_agg_func(expr)? {
                     agg_funcs.push((alias.value.clone(), agg));
+                } else if is_simple_column(expr) {
+                    projections.push(alias.value.clone());
                 } else {
-                    let _col = expr_to_col_name(expr)?;
+                    let e = sql_expr_to_expr(expr)?;
+                    computed.push((alias.value.clone(), e));
                     projections.push(alias.value.clone());
                 }
             }
@@ -494,6 +620,15 @@ fn translate_select(select: Select, schema: Schema) -> Result<LogicalPlan, SqlEr
         GroupByExpr::All(_) => {
             return Err(err("GROUP BY ALL not supported"));
         }
+    }
+
+    // Materialize computed expressions before projection so aliases are real
+    // columns by the time Sort, Filter (HAVING), and Project run.
+    if !computed.is_empty() {
+        plan = LogicalPlan::Extend {
+            input: Box::new(plan),
+            computed,
+        };
     }
 
     // Apply aggregation if needed.
@@ -530,9 +665,7 @@ fn translate_select(select: Select, schema: Schema) -> Result<LogicalPlan, SqlEr
 }
 
 /// Try to extract an aggregate function from a SQL expression.
-fn try_agg_func(
-    expr: &SqlExpr,
-) -> Result<Option<(String, AggFunc)>, SqlError> {
+fn try_agg_func(expr: &SqlExpr) -> Result<Option<(String, AggFunc)>, SqlError> {
     if let SqlExpr::Function(func) = expr {
         let name = func.name.to_string().to_uppercase();
         let out_name = func.name.to_string().to_lowercase();
@@ -567,9 +700,9 @@ fn agg_arg_col(func: &sqlparser::ast::Function) -> Result<String, SqlError> {
         FunctionArguments::List(list) => {
             if list.args.len() == 1 {
                 match &list.args[0] {
-                    sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
-                        expr_to_col_name(e)
-                    }
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ) => expr_to_col_name(e),
                     other => Err(err(format!("unsupported agg arg: {:?}", other))),
                 }
             } else {
@@ -583,7 +716,9 @@ fn agg_arg_col(func: &sqlparser::ast::Function) -> Result<String, SqlError> {
 fn expr_to_col_name(expr: &SqlExpr) -> Result<String, SqlError> {
     match expr {
         SqlExpr::Identifier(ident) => Ok(ident.value.clone()),
-        SqlExpr::CompoundIdentifier(parts) => Ok(parts.last().map(|p| p.value.clone()).unwrap_or_default()),
+        SqlExpr::CompoundIdentifier(parts) => {
+            Ok(parts.last().map(|p| p.value.clone()).unwrap_or_default())
+        }
         SqlExpr::Function(func) => Ok(func.name.to_string().to_uppercase()),
         other => Err(err(format!("expected column name, got: {:?}", other))),
     }
@@ -633,19 +768,35 @@ fn sql_expr_to_expr(expr: &SqlExpr) -> Result<Expr, SqlError> {
             let e = sql_expr_to_expr(inner)?;
             Ok(Expr::is_not_null(e))
         }
-        SqlExpr::Like { negated, expr, pattern, .. } => {
+        SqlExpr::Like {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+            ..
+        } => {
             let val = sql_expr_to_expr(expr)?;
             let pat = sql_expr_to_expr(pattern)?;
-            let like_expr = Expr::like(val, pat);
+            let like_expr = match parse_escape_char(escape_char.as_deref())? {
+                Some(c) => Expr::like_escape(val, pat, c),
+                None => Expr::like(val, pat),
+            };
             if *negated {
                 Ok(Expr::not(like_expr))
             } else {
                 Ok(like_expr)
             }
         }
-        SqlExpr::InList { expr, list, negated } => {
+        SqlExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
             let val = sql_expr_to_expr(expr)?;
-            let items: Vec<Expr> = list.iter().map(|e| sql_expr_to_expr(e)).collect::<Result<_, _>>()?;
+            let items: Vec<Expr> = list
+                .iter()
+                .map(sql_expr_to_expr)
+                .collect::<Result<_, _>>()?;
             let in_expr = Expr::in_list(val, items);
             if *negated {
                 Ok(Expr::not(in_expr))
@@ -653,7 +804,12 @@ fn sql_expr_to_expr(expr: &SqlExpr) -> Result<Expr, SqlError> {
                 Ok(in_expr)
             }
         }
-        SqlExpr::Between { expr, negated, low, high } => {
+        SqlExpr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
             let val = sql_expr_to_expr(expr)?;
             let lo = sql_expr_to_expr(low)?;
             let hi = sql_expr_to_expr(high)?;
@@ -664,7 +820,12 @@ fn sql_expr_to_expr(expr: &SqlExpr) -> Result<Expr, SqlError> {
                 Ok(between_expr)
             }
         }
-        SqlExpr::Case { operand, conditions, results, else_result } => {
+        SqlExpr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
             let op = match operand {
                 Some(e) => Some(sql_expr_to_expr(e)?),
                 None => None,
@@ -683,9 +844,10 @@ fn sql_expr_to_expr(expr: &SqlExpr) -> Result<Expr, SqlError> {
         SqlExpr::Function(func) => {
             let name = func.name.to_string().to_uppercase();
             match name.as_str() {
-                "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {
-                    Err(err(format!("aggregate function {} not allowed in this context", name)))
-                }
+                "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => Err(err(format!(
+                    "aggregate function {} not allowed in this context",
+                    name
+                ))),
                 _ => {
                     use sqlparser::ast::FunctionArguments;
                     let args = match &func.args {
@@ -693,26 +855,26 @@ fn sql_expr_to_expr(expr: &SqlExpr) -> Result<Expr, SqlError> {
                         FunctionArguments::Subquery(_) => {
                             return Err(err("subquery function args not supported"));
                         }
-                        FunctionArguments::List(list) => {
-                            list.args.iter().map(|arg| {
-                                match arg {
-                                    sqlparser::ast::FunctionArg::Unnamed(
-                                        sqlparser::ast::FunctionArgExpr::Expr(e)
-                                    ) => sql_expr_to_expr(e),
-                                    sqlparser::ast::FunctionArg::Unnamed(
-                                        sqlparser::ast::FunctionArgExpr::Wildcard
-                                    ) => Ok(Expr::lit(Value::Null)),
-                                    other => Err(err(format!("unsupported function arg: {:?}", other))),
-                                }
-                            }).collect::<Result<Vec<_>, _>>()?
-                        }
+                        FunctionArguments::List(list) => list
+                            .args
+                            .iter()
+                            .map(|arg| match arg {
+                                sqlparser::ast::FunctionArg::Unnamed(
+                                    sqlparser::ast::FunctionArgExpr::Expr(e),
+                                ) => sql_expr_to_expr(e),
+                                sqlparser::ast::FunctionArg::Unnamed(
+                                    sqlparser::ast::FunctionArgExpr::Wildcard,
+                                ) => Ok(Expr::lit(Value::Null)),
+                                other => Err(err(format!("unsupported function arg: {:?}", other))),
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
                     };
                     Ok(Expr::function(name, args))
                 }
             }
         }
         SqlExpr::TypedString { data_type, value } => {
-            use crate::query::expr::{parse_timestamp_str, parse_date_str, parse_uuid_str};
+            use crate::query::expr::{parse_date_str, parse_timestamp_str, parse_uuid_str};
             match data_type {
                 sqlparser::ast::DataType::Timestamp(_, _) => {
                     let us = parse_timestamp_str(value)
@@ -732,8 +894,10 @@ fn sql_expr_to_expr(expr: &SqlExpr) -> Result<Expr, SqlError> {
                 _ => Ok(Expr::lit(Value::Text(value.clone()))),
             }
         }
-        SqlExpr::Cast { expr, data_type, .. } => {
-            use crate::query::expr::{parse_timestamp_str, parse_date_str, parse_uuid_str};
+        SqlExpr::Cast {
+            expr, data_type, ..
+        } => {
+            use crate::query::expr::{parse_date_str, parse_timestamp_str, parse_uuid_str};
             // For SQL expressions in WHERE/SELECT, we evaluate CASTs at plan time if the inner is a literal.
             let inner = sql_expr_to_expr(expr)?;
             match data_type {

@@ -145,11 +145,10 @@ impl StateMachine for BufferPool {
                 let mut outgoing = Vec::new();
 
                 // Evict if at capacity and this is a new page.
-                if !self.cache.contains_key(&page_id) {
-                    if let Some(write_msg) = self.evict_one() {
+                if !self.cache.contains_key(&page_id)
+                    && let Some(write_msg) = self.evict_one() {
                         outgoing.push(write_msg);
                     }
-                }
 
                 // Insert or update the page.
                 if let Some(entry) = self.cache.get_mut(&page_id) {
@@ -218,10 +217,7 @@ impl StateMachine for BufferPool {
                             .map(|r| {
                                 (
                                     Message::BufPoolPageNotFound { page_id },
-                                    Destination {
-                                        actor: r,
-                                        delay: 0,
-                                    },
+                                    Destination { actor: r, delay: 0 },
                                 )
                             })
                             .collect();
@@ -232,11 +228,10 @@ impl StateMachine for BufferPool {
 
                 // Evict if needed.
                 let mut outgoing = Vec::new();
-                if !self.cache.contains_key(&page_id) {
-                    if let Some(write_msg) = self.evict_one() {
+                if !self.cache.contains_key(&page_id)
+                    && let Some(write_msg) = self.evict_one() {
                         outgoing.push(write_msg);
                     }
-                }
 
                 // Cache the page.
                 let entry = PageEntry::new(data.clone(), self.now);
@@ -273,10 +268,7 @@ impl StateMachine for BufferPool {
                         .map(|r| {
                             (
                                 Message::BufPoolPageNotFound { page_id },
-                                Destination {
-                                    actor: r,
-                                    delay: 0,
-                                },
+                                Destination { actor: r, delay: 0 },
                             )
                         })
                         .collect();
@@ -313,7 +305,6 @@ impl StateMachine for BufferPool {
                 if let Some((requester, ref mut remaining)) = self.flush_pending {
                     *remaining = remaining.saturating_sub(1);
                     if *remaining == 0 {
-                        let requester = requester;
                         self.flush_pending = None;
                         return Some(vec![(
                             Message::BufPoolFlushOk,
