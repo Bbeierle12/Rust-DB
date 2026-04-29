@@ -483,13 +483,14 @@ impl DbQueryHandler {
     fn new(
         db: Database,
         conn_id: u64,
+        state: Arc<Mutex<ConnState>>,
         metrics: Metrics,
         statement_timeout: Option<std::time::Duration>,
     ) -> Self {
         Self {
             db,
             conn_id,
-            state: Arc::new(Mutex::new(ConnState { active_txn: None })),
+            state,
             metrics,
             statement_timeout,
         }
@@ -520,6 +521,7 @@ impl std::error::Error for StatementTimeout {}
 async fn run_engine_query_with_timeout(
     db: &Database,
     sql: &str,
+    active_txn: Option<u64>,
     timeout: Option<std::time::Duration>,
 ) -> (
     String,
@@ -528,7 +530,10 @@ async fn run_engine_query_with_timeout(
     let preprocessed = preprocess_sql(sql);
     let db_clone = db.clone();
     let pre_clone = preprocessed.clone();
-    let work = tokio::task::spawn_blocking(move || db_clone.execute_sql(&pre_clone));
+    let work = tokio::task::spawn_blocking(move || match active_txn {
+        Some(txn_id) => db_clone.execute_sql_in_txn(&pre_clone, txn_id),
+        None => db_clone.execute_sql(&pre_clone),
+    });
     let outcome: Result<SqlResult, Box<dyn std::error::Error + Send + Sync>> = match timeout {
         Some(t) => match tokio::time::timeout(t, work).await {
             Ok(Ok(Ok(r))) => Ok(r),
@@ -543,6 +548,21 @@ async fn run_engine_query_with_timeout(
         },
     };
     (preprocessed, outcome)
+}
+
+fn current_active_txn(state: &Arc<Mutex<ConnState>>) -> Option<u64> {
+    state.lock().unwrap().active_txn
+}
+
+fn clear_active_txn(db: &Database, state: &Arc<Mutex<ConnState>>) {
+    if let Some(txn_id) = state.lock().unwrap().active_txn.take() {
+        let _ = db.abort(txn_id);
+    }
+}
+
+fn is_transaction_control_sql(sql: &str) -> bool {
+    let upper = preprocess_sql(sql).trim().to_uppercase();
+    upper == "BEGIN" || upper == "COMMIT" || upper == "ROLLBACK"
 }
 
 /// Convert an engine error into a pgwire `UserError`. Preserves the
@@ -607,9 +627,18 @@ impl DbQueryHandler {
         if let Some(intercepted) = intercept_system_query(&preprocessed, &self.db) {
             return Ok(intercepted);
         }
+        let active_txn = current_active_txn(&self.state);
         let (_pre, outcome) =
-            run_engine_query_with_timeout(&self.db, sql, self.statement_timeout).await;
-        let result = outcome.map_err(engine_err_to_pgwire)?;
+            run_engine_query_with_timeout(&self.db, sql, active_txn, self.statement_timeout).await;
+        let result = match outcome {
+            Ok(result) => result,
+            Err(err) => {
+                if active_txn.is_some() && !is_transaction_control_sql(&preprocessed) {
+                    clear_active_txn(&self.db, &self.state);
+                }
+                return Err(engine_err_to_pgwire(err));
+            }
+        };
         execute_sql_result(result, &self.state, &self.db).map_err(|e| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_string(),
@@ -1859,9 +1888,18 @@ impl DbExtendedQueryHandler {
         if let Some(intercepted) = intercept_system_query(&preprocessed, &self.db) {
             return Ok(intercepted);
         }
+        let active_txn = current_active_txn(&self.state);
         let (_pre, outcome) =
-            run_engine_query_with_timeout(&self.db, sql, self.statement_timeout).await;
-        let result = outcome.map_err(engine_err_to_pgwire)?;
+            run_engine_query_with_timeout(&self.db, sql, active_txn, self.statement_timeout).await;
+        let result = match outcome {
+            Ok(result) => result,
+            Err(err) => {
+                if active_txn.is_some() && !is_transaction_control_sql(&preprocessed) {
+                    clear_active_txn(&self.db, &self.state);
+                }
+                return Err(engine_err_to_pgwire(err));
+            }
+        };
         execute_sql_result(result, &self.state, &self.db).map_err(|e| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_string(),
@@ -2129,7 +2167,8 @@ impl ExtendedQueryHandler for DbExtendedQueryHandler {
 
 struct DbHandlerFactory {
     db: Database,
-    next_conn_id: Arc<AtomicU64>,
+    conn_id: u64,
+    state: Arc<Mutex<ConnState>>,
     auth: Option<Arc<Mutex<AuthManager>>>,
     metrics: Metrics,
     statement_timeout: Option<std::time::Duration>,
@@ -2149,22 +2188,20 @@ impl PgWireHandlerFactory for DbHandlerFactory {
     }
 
     fn simple_query_handler(&self) -> Arc<Self::SimpleQueryHandler> {
-        let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         Arc::new(DbQueryHandler::new(
             self.db.clone(),
-            conn_id,
+            self.conn_id,
+            self.state.clone(),
             self.metrics.clone(),
             self.statement_timeout,
         ))
     }
 
     fn extended_query_handler(&self) -> Arc<Self::ExtendedQueryHandler> {
-        let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
-        let state = Arc::new(Mutex::new(ConnState { active_txn: None }));
         Arc::new(DbExtendedQueryHandler::new(
             self.db.clone(),
-            conn_id,
-            state,
+            self.conn_id,
+            self.state.clone(),
             self.metrics.clone(),
             self.statement_timeout,
         ))
@@ -2371,9 +2408,11 @@ async fn main() {
                 info!(peer = %peer_addr, "new connection");
                 metrics.connection_opened();
 
+                let conn_id = next_conn_id.fetch_add(1, Ordering::Relaxed);
                 let factory = Arc::new(DbHandlerFactory {
                     db: db.clone(),
-                    next_conn_id: Arc::clone(&next_conn_id),
+                    conn_id,
+                    state: Arc::new(Mutex::new(ConnState { active_txn: None })),
                     auth: auth.clone(),
                     metrics: metrics.clone(),
                     statement_timeout: if cfg.statement_timeout > 0 {

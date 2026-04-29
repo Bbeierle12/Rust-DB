@@ -427,6 +427,36 @@ impl Database {
         Ok(())
     }
 
+    fn ensure_active_txn(&self, txn_id: u64) -> DbResult<()> {
+        let inner = self.lock_inner()?;
+        if inner.active.contains_key(&txn_id) {
+            Ok(())
+        } else {
+            Err(DbError::NoSuchTxn(txn_id))
+        }
+    }
+
+    fn statement_txn(&self, txn_id: Option<u64>) -> DbResult<(u64, bool)> {
+        match txn_id {
+            Some(txn_id) => {
+                self.ensure_active_txn(txn_id)?;
+                Ok((txn_id, false))
+            }
+            None => Ok((self.begin()?, true)),
+        }
+    }
+
+    fn finish_statement_txn(&self, txn_id: u64, implicit: bool) -> DbResult<()> {
+        if implicit {
+            self.commit(txn_id)?;
+        }
+        Ok(())
+    }
+
+    fn abort_statement_txn(&self, txn_id: u64) -> DbResult<()> {
+        self.abort(txn_id)
+    }
+
     pub fn execute_sql(&self, sql: &str) -> DbResult<SqlResult> {
         let stripped = strip_sql_comments(sql);
         let trimmed = stripped.trim();
@@ -462,6 +492,37 @@ impl Database {
             return self.execute_delete(trimmed);
         }
         self.execute_select(trimmed)
+    }
+
+    pub fn execute_sql_in_txn(&self, sql: &str, txn_id: u64) -> DbResult<SqlResult> {
+        self.ensure_active_txn(txn_id)?;
+        let stripped = strip_sql_comments(sql);
+        let trimmed = stripped.trim();
+        let upper = trimmed.to_uppercase();
+        if upper == "BEGIN" {
+            return Err(DbError::Sql("transaction already active".into()));
+        }
+        if upper == "COMMIT" {
+            return Ok(SqlResult::Commit);
+        }
+        if upper == "ROLLBACK" {
+            return Ok(SqlResult::Rollback);
+        }
+        if upper.starts_with("CREATE") || upper.starts_with("DROP") {
+            return Err(DbError::Sql(
+                "DDL statements inside explicit transactions are not yet supported".into(),
+            ));
+        }
+        if upper.starts_with("INSERT") {
+            return self.execute_insert_in_txn(trimmed, Some(txn_id));
+        }
+        if upper.starts_with("UPDATE") {
+            return self.execute_update_in_txn(trimmed, Some(txn_id));
+        }
+        if upper.starts_with("DELETE") {
+            return self.execute_delete_in_txn(trimmed, Some(txn_id));
+        }
+        self.execute_select_in_txn(trimmed, Some(txn_id))
     }
 
     fn execute_create_table(&self, sql: &str) -> DbResult<SqlResult> {
@@ -767,6 +828,10 @@ impl Database {
     }
 
     fn execute_insert(&self, sql: &str) -> DbResult<SqlResult> {
+        self.execute_insert_in_txn(sql, None)
+    }
+
+    fn execute_insert_in_txn(&self, sql: &str, statement_txn: Option<u64>) -> DbResult<SqlResult> {
         use sqlparser::ast::{SetExpr, Statement};
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
@@ -779,7 +844,7 @@ impl Database {
             Statement::Insert(insert) => {
                 let table_name = insert.table_name.to_string();
                 let inner = self.lock_inner()?;
-                let snapshot_ts = inner.next_ts.saturating_sub(1);
+                let snapshot_ts = statement_snapshot_ts(&inner, statement_txn)?;
                 let schema = Catalog::get_table(&inner.store, &table_name, snapshot_ts)
                     .ok_or_else(|| DbError::NoSuchTable(table_name.clone()))?;
                 let indexes =
@@ -812,11 +877,11 @@ impl Database {
                 // Parse ON CONFLICT clause
                 let on_conflict = &insert.on;
 
-                let txn_id = self.begin()?;
+                let (txn_id, implicit_txn) = self.statement_txn(statement_txn)?;
                 let mut count = 0u64;
                 for value_row in value_rows {
                     if value_row.len() != target_cols.len() {
-                        self.abort(txn_id)?;
+                        self.abort_statement_txn(txn_id)?;
                         return Err(DbError::Sql(format!(
                             "expected {} values, got {}",
                             target_cols.len(),
@@ -829,7 +894,7 @@ impl Database {
                         let coerced = match coerce_value_for_column(value, col_name, &schema) {
                             Ok(v) => v,
                             Err(e) => {
-                                self.abort(txn_id)?;
+                                self.abort_statement_txn(txn_id)?;
                                 return Err(e);
                             }
                         };
@@ -839,7 +904,7 @@ impl Database {
                         if !col.nullable {
                             let val = row.get(&col.name).unwrap_or(&Value::Null);
                             if val.is_null() {
-                                self.abort(txn_id)?;
+                                self.abort_statement_txn(txn_id)?;
                                 return Err(DbError::Constraint(format!(
                                     "column '{}' cannot be null",
                                     col.name
@@ -915,7 +980,7 @@ impl Database {
                     }
                     count += 1;
                 }
-                self.commit(txn_id)?;
+                self.finish_statement_txn(txn_id, implicit_txn)?;
                 if has_returning {
                     let column_types = column_types_from_schema(&returning_cols, &schema);
                     Ok(SqlResult::Query {
@@ -932,6 +997,10 @@ impl Database {
     }
 
     fn execute_update(&self, sql: &str) -> DbResult<SqlResult> {
+        self.execute_update_in_txn(sql, None)
+    }
+
+    fn execute_update_in_txn(&self, sql: &str, statement_txn: Option<u64>) -> DbResult<SqlResult> {
         use sqlparser::ast::Statement;
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
@@ -950,7 +1019,7 @@ impl Database {
             } => {
                 let table_name = table.relation.to_string();
                 let inner = self.lock_inner()?;
-                let snapshot_ts = inner.next_ts.saturating_sub(1);
+                let snapshot_ts = statement_snapshot_ts(&inner, statement_txn)?;
                 let schema = Catalog::get_table(&inner.store, &table_name, snapshot_ts)
                     .ok_or_else(|| DbError::NoSuchTable(table_name.clone()))?;
                 let indexes =
@@ -966,7 +1035,7 @@ impl Database {
                 };
                 let mut returned_rows: Vec<Row> = Vec::new();
 
-                let rows = self.scan_table_rows(&schema)?;
+                let rows = self.scan_table_rows_for_txn(&schema, statement_txn)?;
                 let predicate = match selection {
                     Some(expr) => Some(crate::query::sql::sql_to_plan(
                         &format!("SELECT * FROM {} WHERE {}", table_name, expr),
@@ -975,7 +1044,7 @@ impl Database {
                     None => None,
                 };
 
-                let txn_id = self.begin()?;
+                let (txn_id, implicit_txn) = self.statement_txn(statement_txn)?;
                 let mut count = 0u64;
                 for row in &rows {
                     if let Some(ref plan) = predicate
@@ -1015,7 +1084,7 @@ impl Database {
                     }
                     count += 1;
                 }
-                self.commit(txn_id)?;
+                self.finish_statement_txn(txn_id, implicit_txn)?;
                 if has_returning {
                     let column_types = column_types_from_schema(&returning_cols, &schema);
                     Ok(SqlResult::Query {
@@ -1032,6 +1101,10 @@ impl Database {
     }
 
     fn execute_delete(&self, sql: &str) -> DbResult<SqlResult> {
+        self.execute_delete_in_txn(sql, None)
+    }
+
+    fn execute_delete_in_txn(&self, sql: &str, statement_txn: Option<u64>) -> DbResult<SqlResult> {
         use sqlparser::ast::Statement;
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
@@ -1055,7 +1128,7 @@ impl Database {
                         .ok_or_else(|| DbError::Sql("DELETE requires FROM clause".into()))?
                 };
                 let inner = self.lock_inner()?;
-                let snapshot_ts = inner.next_ts.saturating_sub(1);
+                let snapshot_ts = statement_snapshot_ts(&inner, statement_txn)?;
                 let schema = Catalog::get_table(&inner.store, &table_name, snapshot_ts)
                     .ok_or_else(|| DbError::NoSuchTable(table_name.clone()))?;
                 let indexes =
@@ -1071,7 +1144,7 @@ impl Database {
                 };
                 let mut returned_rows: Vec<Row> = Vec::new();
 
-                let rows = self.scan_table_rows(&schema)?;
+                let rows = self.scan_table_rows_for_txn(&schema, statement_txn)?;
                 let predicate = match &delete.selection {
                     Some(expr) => Some(crate::query::sql::sql_to_plan(
                         &format!("SELECT * FROM {} WHERE {}", table_name, expr),
@@ -1080,7 +1153,7 @@ impl Database {
                     None => None,
                 };
 
-                let txn_id = self.begin()?;
+                let (txn_id, implicit_txn) = self.statement_txn(statement_txn)?;
                 let mut count = 0u64;
                 for row in &rows {
                     if let Some(ref plan) = predicate
@@ -1102,7 +1175,7 @@ impl Database {
                     self.delete(txn_id, key)?;
                     count += 1;
                 }
-                self.commit(txn_id)?;
+                self.finish_statement_txn(txn_id, implicit_txn)?;
                 if has_returning {
                     let column_types = column_types_from_schema(&returning_cols, &schema);
                     Ok(SqlResult::Query {
@@ -1119,8 +1192,12 @@ impl Database {
     }
 
     fn execute_select(&self, sql: &str) -> DbResult<SqlResult> {
+        self.execute_select_in_txn(sql, None)
+    }
+
+    fn execute_select_in_txn(&self, sql: &str, statement_txn: Option<u64>) -> DbResult<SqlResult> {
         let inner = self.lock_inner()?;
-        let snapshot_ts = inner.next_ts.saturating_sub(1);
+        let snapshot_ts = statement_snapshot_ts(&inner, statement_txn)?;
 
         // Try multi-table path first (handles JOINs).
         let plan = sql_to_plan_multi(sql, |name| {
@@ -1131,11 +1208,17 @@ impl Database {
 
         if table_names.len() > 1 {
             // Multi-table query: build sources map with prefixed column names.
-            let mut sources: BTreeMap<String, Vec<Row>> = BTreeMap::new();
+            let mut schemas: BTreeMap<String, Schema> = BTreeMap::new();
             for tname in &table_names {
                 let schema = Catalog::get_table(&inner.store, tname, snapshot_ts)
                     .ok_or_else(|| DbError::NoSuchTable(tname.clone()))?;
-                let raw_rows = scan_table_rows_inner(&inner.store, &schema, snapshot_ts);
+                schemas.insert(tname.clone(), schema);
+            }
+            drop(inner);
+
+            let mut sources: BTreeMap<String, Vec<Row>> = BTreeMap::new();
+            for (tname, schema) in &schemas {
+                let raw_rows = self.scan_table_rows_for_txn(schema, statement_txn)?;
                 let prefixed: Vec<Row> = raw_rows
                     .into_iter()
                     .map(|row| {
@@ -1146,29 +1229,20 @@ impl Database {
                     .collect();
                 sources.insert(tname.clone(), prefixed);
             }
-            drop(inner);
 
             let result_rows = execute_with_sources(&plan, &sources);
             let columns: Vec<String> = if let Some(proj_cols) = plan.project_columns() {
                 proj_cols
             } else if result_rows.is_empty() {
-                // Collect from all schemas
                 table_names
                     .iter()
-                    .flat_map(|t| {
-                        // Re-acquire lock briefly for schema lookup
-                        let inner = self.inner.lock().ok();
-                        inner
-                            .and_then(|i| {
-                                let ts = i.next_ts.saturating_sub(1);
-                                Catalog::get_table(&i.store, t, ts).map(|s| {
-                                    s.columns
-                                        .iter()
-                                        .map(|c| format!("{}.{}", t, c.name))
-                                        .collect::<Vec<_>>()
-                                })
-                            })
-                            .unwrap_or_default()
+                    .flat_map(|t| match schemas.get(t) {
+                        Some(schema) => schema
+                            .columns
+                            .iter()
+                            .map(|c| format!("{}.{}", t, c.name))
+                            .collect::<Vec<_>>(),
+                        None => Vec::new(),
                     })
                     .collect()
             } else {
@@ -1188,9 +1262,9 @@ impl Database {
                 .ok_or_else(|| DbError::Sql("could not determine table name".into()))?;
             let schema = Catalog::get_table(&inner.store, &table_name, snapshot_ts)
                 .ok_or_else(|| DbError::NoSuchTable(table_name.clone()))?;
-            let rows = scan_table_rows_inner(&inner.store, &schema, snapshot_ts);
             drop(inner);
 
+            let rows = self.scan_table_rows_for_txn(&schema, statement_txn)?;
             let result_rows = execute(&plan, rows);
             let columns: Vec<String> = if let Some(proj_cols) = plan.project_columns() {
                 proj_cols
@@ -1211,19 +1285,32 @@ impl Database {
     fn scan_table_rows(&self, schema: &Schema) -> DbResult<Vec<Row>> {
         let inner = self.lock_inner()?;
         let snapshot_ts = inner.next_ts.saturating_sub(1);
-        let table_prefix = format!("{}\x00", schema.table);
-        let prefix_bytes = table_prefix.as_bytes();
-        let mut end_bytes = prefix_bytes.to_vec();
-        if let Some(last) = end_bytes.last_mut() {
-            *last = last.wrapping_add(1);
-        }
+        let (prefix_bytes, end_bytes) = table_key_bounds(&schema.table);
         let raw_entries = inner
             .store
-            .scan(Some(prefix_bytes), Some(&end_bytes), snapshot_ts);
+            .scan(Some(&prefix_bytes), Some(&end_bytes), snapshot_ts);
         Ok(raw_entries
             .iter()
             .filter_map(|(_, data)| schema.decode_row(data))
             .collect())
+    }
+
+    fn scan_table_rows_for_txn(
+        &self,
+        schema: &Schema,
+        statement_txn: Option<u64>,
+    ) -> DbResult<Vec<Row>> {
+        match statement_txn {
+            Some(txn_id) => {
+                let (prefix_bytes, end_bytes) = table_key_bounds(&schema.table);
+                let raw_entries = self.scan(txn_id, Some(&prefix_bytes), Some(&end_bytes))?;
+                Ok(raw_entries
+                    .iter()
+                    .filter_map(|(_, data)| schema.decode_row(data))
+                    .collect())
+            }
+            None => self.scan_table_rows(schema),
+        }
     }
 
     pub fn data_dir(&self) -> DbResult<PathBuf> {
@@ -1297,19 +1384,24 @@ fn checkpoint_locked(inner: &mut DatabaseInner) -> DbResult<()> {
     Ok(())
 }
 
-/// Scan and decode all rows for a table from the store (no locking).
-fn scan_table_rows_inner(store: &MvccStore, schema: &Schema, snapshot_ts: u64) -> Vec<Row> {
-    let table_prefix = format!("{}\x00", schema.table);
-    let prefix_bytes = table_prefix.as_bytes();
-    let mut end_bytes = prefix_bytes.to_vec();
+fn statement_snapshot_ts(inner: &DatabaseInner, txn_id: Option<u64>) -> DbResult<u64> {
+    match txn_id {
+        Some(txn_id) => inner
+            .active
+            .get(&txn_id)
+            .map(|txn| txn.start_ts)
+            .ok_or(DbError::NoSuchTxn(txn_id)),
+        None => Ok(inner.next_ts.saturating_sub(1)),
+    }
+}
+
+fn table_key_bounds(table: &str) -> (Vec<u8>, Vec<u8>) {
+    let prefix_bytes = format!("{}\x00", table).into_bytes();
+    let mut end_bytes = prefix_bytes.clone();
     if let Some(last) = end_bytes.last_mut() {
         *last = last.wrapping_add(1);
     }
-    let raw_entries = store.scan(Some(prefix_bytes), Some(&end_bytes), snapshot_ts);
-    raw_entries
-        .iter()
-        .filter_map(|(_, data)| schema.decode_row(data))
-        .collect()
+    (prefix_bytes, end_bytes)
 }
 
 pub enum SqlResult {

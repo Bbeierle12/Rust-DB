@@ -317,6 +317,11 @@ fn client_tls_config(cert_der: &[u8]) -> Arc<ClientConfig> {
 /// returned cell matches `expected`. Avoids type-OID brittleness in the binary
 /// extended-query path.
 async fn assert_simple_select(client: &tokio_postgres::Client, sql: &str, expected: &str) {
+    let cell = simple_query_first_cell(client, sql).await;
+    assert_eq!(cell, expected, "unexpected cell value");
+}
+
+async fn simple_query_first_cell(client: &tokio_postgres::Client, sql: &str) -> String {
     use tokio_postgres::SimpleQueryMessage;
     let messages = client.simple_query(sql).await.expect("simple_query");
     let row = messages
@@ -326,8 +331,7 @@ async fn assert_simple_select(client: &tokio_postgres::Client, sql: &str, expect
             _ => None,
         })
         .expect("expected at least one row");
-    let cell = row.get(0).expect("expected non-null cell");
-    assert_eq!(cell, expected, "unexpected cell value");
+    row.get(0).expect("expected non-null cell").to_string()
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -348,6 +352,32 @@ async fn pgwire_tls_round_trip() {
     });
 
     assert_simple_select(&client, "SELECT 1", "1").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pgwire_rollback_actually_rolls_back() {
+    let server = spawn_server(None);
+
+    let conn_str = format!(
+        "host=127.0.0.1 port={} user=test dbname=postgres sslmode=disable",
+        server.pgwire_port
+    );
+    let (client, conn) = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
+        .await
+        .expect("plaintext connect");
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    client
+        .batch_execute(
+            "CREATE TABLE rb_test (v INT); BEGIN; INSERT INTO rb_test VALUES (1); ROLLBACK;",
+        )
+        .await
+        .expect("transaction batch");
+
+    let count = simple_query_first_cell(&client, "SELECT COUNT(*) FROM rb_test").await;
+    assert_eq!(count, "0");
 }
 
 #[tokio::test(flavor = "multi_thread")]
