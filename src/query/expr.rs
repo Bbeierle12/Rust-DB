@@ -534,11 +534,15 @@ impl Value {
 pub type Row = BTreeMap<String, Value>;
 
 /// Column definition.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Column {
     pub name: String,
     pub col_type: ValueType,
     pub nullable: bool,
+    /// Constant DEFAULT value, applied when an INSERT omits this column.
+    /// Only constant defaults are captured; expression defaults such as
+    /// `now()` or `gen_random_uuid()` are not stored.
+    pub default: Option<Value>,
 }
 
 impl Column {
@@ -547,6 +551,7 @@ impl Column {
             name: name.into(),
             col_type,
             nullable: true,
+            default: None,
         }
     }
 
@@ -554,10 +559,15 @@ impl Column {
         self.nullable = false;
         self
     }
+
+    pub fn with_default(mut self, value: Value) -> Self {
+        self.default = Some(value);
+        self
+    }
 }
 
 /// Table schema: ordered list of columns.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Schema {
     pub table: String,
     pub columns: Vec<Column>,

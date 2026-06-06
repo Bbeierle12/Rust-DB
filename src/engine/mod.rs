@@ -542,8 +542,21 @@ impl Database {
                     let mut col =
                         crate::query::expr::Column::new(col_def.name.value.clone(), col_type);
                     for opt in &col_def.options {
-                        if matches!(opt.option, sqlparser::ast::ColumnOption::NotNull) {
-                            col = col.not_null();
+                        match &opt.option {
+                            sqlparser::ast::ColumnOption::NotNull => {
+                                col = col.not_null();
+                            }
+                            sqlparser::ast::ColumnOption::Default(expr) => {
+                                // Capture constant defaults only. Non-constant
+                                // expressions (now(), gen_random_uuid(), ...) can't
+                                // be reduced to a stored Value and are ignored.
+                                if let Ok(value) = sql_expr_to_value(expr) {
+                                    if !value.is_null() {
+                                        col = col.with_default(value);
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                     columns.push(col);
@@ -899,6 +912,17 @@ impl Database {
                             }
                         };
                         row.insert(col_name.clone(), coerced);
+                    }
+                    // Apply DEFAULT values for any columns omitted from the INSERT.
+                    for col in &schema.columns {
+                        if !row.contains_key(&col.name) {
+                            if let Some(default) = &col.default {
+                                let coerced =
+                                    coerce_value_for_column(default.clone(), &col.name, &schema)
+                                        .unwrap_or_else(|_| default.clone());
+                                row.insert(col.name.clone(), coerced);
+                            }
+                        }
                     }
                     for col in &schema.columns {
                         if !col.nullable {

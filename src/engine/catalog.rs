@@ -5,11 +5,16 @@
 //!
 //! Index definitions are stored under `__index__\x00{index_name}`.
 
-use crate::query::expr::{Column, Schema, ValueType};
+use crate::query::expr::{Column, Schema, Value, ValueType};
 use crate::txn::mvcc::MvccStore;
 
 const CATALOG_PREFIX: &[u8] = b"__catalog__\x00";
 const INDEX_PREFIX: &[u8] = b"__index__\x00";
+
+/// Sentinel written at the start of a v2 schema encoding (which carries column
+/// DEFAULT values). It is not a valid table-name length, so decoders can tell it
+/// apart from the v1 layout, which began directly with the table-name length.
+const SCHEMA_FORMAT_V2_MARKER: u32 = 0xFFFF_FFFF;
 
 /// Index definition stored in the catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +28,10 @@ pub struct IndexDef {
 /// Encode a Schema to bytes for storage.
 fn encode_schema(schema: &Schema) -> Vec<u8> {
     let mut buf = Vec::new();
+
+    // Format version marker (see SCHEMA_FORMAT_V2_MARKER). Written first so the
+    // decoder can distinguish v2 (with column defaults) from the original layout.
+    buf.extend_from_slice(&SCHEMA_FORMAT_V2_MARKER.to_le_bytes());
 
     // Table name.
     let name_bytes = schema.table.as_bytes();
@@ -61,6 +70,15 @@ fn encode_schema(schema: &Schema) -> Vec<u8> {
 
         // Nullable.
         buf.push(col.nullable as u8);
+
+        // Default value (v2): presence flag followed by the encoded Value.
+        match &col.default {
+            Some(value) => {
+                buf.push(1);
+                buf.extend_from_slice(&value.encode());
+            }
+            None => buf.push(0),
+        }
     }
 
     buf
@@ -69,6 +87,14 @@ fn encode_schema(schema: &Schema) -> Vec<u8> {
 /// Decode a Schema from bytes.
 fn decode_schema(data: &[u8]) -> Option<Schema> {
     let mut pos = 0;
+
+    // Detect format version: v2 begins with the sentinel marker and carries
+    // per-column defaults; v1 begins directly with the table-name length.
+    let first = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?);
+    let has_defaults = first == SCHEMA_FORMAT_V2_MARKER;
+    if has_defaults {
+        pos += 4;
+    }
 
     // Table name.
     let name_len = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
@@ -119,6 +145,18 @@ fn decode_schema(data: &[u8]) -> Option<Schema> {
         if !nullable {
             col = col.not_null();
         }
+
+        // Default value (v2 only).
+        if has_defaults {
+            let has_default = *data.get(pos)? != 0;
+            pos += 1;
+            if has_default {
+                let (value, consumed) = Value::decode(data.get(pos..)?)?;
+                pos += consumed;
+                col = col.with_default(value);
+            }
+        }
+
         columns.push(col);
     }
 
