@@ -15,7 +15,7 @@ required-features = ["server"]
 [features]
 pgwire = ["dep:pgwire", "dep:tokio", "dep:async-trait", "dep:futures"]
 python = ["dep:pyo3"]
-server = ["pgwire", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:axum", "dep:serde", "dep:serde_json", "dep:tower-http", "dep:uuid", "dep:toml", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:axum-server", "dep:arc-swap"]
+server = ["pgwire", "dep:postgres-types", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:axum", "dep:serde", "dep:serde_json", "dep:tower-http", "dep:uuid", "dep:toml", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:axum-server", "dep:arc-swap"]
 
 [dependencies]
 pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
@@ -25,6 +25,7 @@ sqlparser = "0.53"
 argon2 = "0.5"
 rand = "0.8"
 pgwire      = { version = "0.26", optional = true }
+postgres-types = { version = "0.2", optional = true }
 tokio       = { version = "1",    features = ["full"], optional = true }
 async-trait = { version = "0.1",  optional = true }
 futures     = { version = "0.3",  optional = true }

@@ -1641,6 +1641,7 @@ dependencies = [
  "futures",
  "libc",
  "pgwire",
+ "postgres-types",
  "pyo3",
  "rand 0.8.5",
  "rcgen",

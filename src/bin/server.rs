@@ -27,7 +27,7 @@ use pgwire::api::ClientInfo;
 use pgwire::api::ClientPortalStore;
 use pgwire::api::auth::{DefaultServerParameterProvider, LoginInfo, StartupHandler};
 use pgwire::api::copy::NoopCopyHandler;
-use pgwire::api::portal::Portal;
+use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
     DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
@@ -41,6 +41,10 @@ use pgwire::messages::response::ErrorResponse;
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use pgwire::tokio::process_socket;
+use pgwire::types::ToSqlText;
+
+use bytes::BufMut;
+use postgres_types::{IsNull, ToSql};
 
 use rust_dst_db::auth::AuthManager;
 use rust_dst_db::engine::{Database, SqlResult};
@@ -639,7 +643,7 @@ impl DbQueryHandler {
                 return Err(engine_err_to_pgwire(err));
             }
         };
-        execute_sql_result(result, &self.state, &self.db).map_err(|e| {
+        execute_sql_result(result, &self.state, &self.db, None).map_err(|e| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_string(),
                 "42000".to_string(),
@@ -670,6 +674,7 @@ fn execute_sql_result<'a>(
     result: SqlResult,
     state: &Arc<Mutex<ConnState>>,
     db: &Database,
+    result_format: Option<&Format>,
 ) -> Result<Response<'a>, Box<dyn std::error::Error>> {
     match result {
         SqlResult::Begin(txn_id) => {
@@ -718,7 +723,10 @@ fn execute_sql_result<'a>(
                         .get(i)
                         .map(value_type_to_pg_type)
                         .unwrap_or(Type::TEXT);
-                    FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
+                    let fmt = result_format
+                        .map(|f| f.format_for(i))
+                        .unwrap_or(FieldFormat::Text);
+                    FieldInfo::new(name.clone(), None, None, pg_type, fmt)
                 })
                 .collect();
             let schema = Arc::new(fields);
@@ -736,8 +744,11 @@ fn execute_sql_result<'a>(
                         if val.is_null() {
                             encoder.encode_field(&None::<&str>)?;
                         } else {
-                            let text = value_to_text(val);
-                            encoder.encode_field(&Some(&text))?;
+                            let pg_type = column_types
+                                .get(i)
+                                .map(value_type_to_pg_type)
+                                .unwrap_or(Type::TEXT);
+                            encoder.encode_field(&WireValue::new(val, &pg_type))?;
                         }
                     }
                     encoder.finish()
@@ -765,6 +776,143 @@ fn value_to_text(v: &Value) -> String {
         Value::Uuid(bytes) => rust_dst_db::query::expr::format_uuid(bytes),
         Value::Decimal(val, scale) => rust_dst_db::query::expr::format_decimal(*val, *scale),
         Value::Vector(v) => rust_dst_db::query::expr::format_vector(v),
+    }
+}
+
+/// PostgreSQL binary wire encoding of a non-null value for a column of the given
+/// type. Driven by the column type rather than the Value variant, because the
+/// engine stores typed columns (UUID, TIMESTAMP, ...) as `Value::Text` literals;
+/// this converts them to the wire binary form the client expects. Anything that
+/// can't be converted falls back to the UTF-8 text bytes.
+fn value_to_binary(v: &Value, ty: &Type) -> Vec<u8> {
+    use rust_dst_db::query::expr::{parse_date_str, parse_timestamp_str, parse_uuid_str};
+    if *ty == Type::BOOL {
+        match v {
+            Value::Bool(b) => return vec![*b as u8],
+            Value::Text(s) => return vec![matches!(s.trim(), "t" | "true" | "TRUE" | "1") as u8],
+            _ => {}
+        }
+    } else if *ty == Type::INT8 {
+        match v {
+            Value::Int64(n) => return n.to_be_bytes().to_vec(),
+            Value::Text(s) => {
+                if let Ok(n) = s.trim().parse::<i64>() {
+                    return n.to_be_bytes().to_vec();
+                }
+            }
+            _ => {}
+        }
+    } else if *ty == Type::INT4 {
+        match v {
+            Value::Int64(n) => return (*n as i32).to_be_bytes().to_vec(),
+            Value::Text(s) => {
+                if let Ok(n) = s.trim().parse::<i32>() {
+                    return n.to_be_bytes().to_vec();
+                }
+            }
+            _ => {}
+        }
+    } else if *ty == Type::FLOAT8 {
+        match v {
+            Value::Float64(f) => return f.to_be_bytes().to_vec(),
+            Value::Int64(n) => return (*n as f64).to_be_bytes().to_vec(),
+            Value::Text(s) => {
+                if let Ok(f) = s.trim().parse::<f64>() {
+                    return f.to_be_bytes().to_vec();
+                }
+            }
+            _ => {}
+        }
+    } else if *ty == Type::UUID {
+        match v {
+            Value::Uuid(b) => return b.to_vec(),
+            Value::Text(s) => {
+                if let Some(b) = parse_uuid_str(s.trim()) {
+                    return b.to_vec();
+                }
+            }
+            _ => {}
+        }
+    } else if *ty == Type::TIMESTAMP || *ty == Type::TIMESTAMPTZ {
+        // PG timestamps are microseconds relative to 2000-01-01; storage is Unix-epoch.
+        match v {
+            Value::Timestamp(us) => return (*us - PG_EPOCH_OFFSET_US).to_be_bytes().to_vec(),
+            Value::Text(s) => {
+                if let Some(us) = parse_timestamp_str(s.trim()) {
+                    return (us - PG_EPOCH_OFFSET_US).to_be_bytes().to_vec();
+                }
+            }
+            _ => {}
+        }
+    } else if *ty == Type::DATE {
+        match v {
+            Value::Date(d) => return (*d - PG_EPOCH_OFFSET_DAYS).to_be_bytes().to_vec(),
+            Value::Text(s) => {
+                if let Some(d) = parse_date_str(s.trim()) {
+                    return (d - PG_EPOCH_OFFSET_DAYS).to_be_bytes().to_vec();
+                }
+            }
+            _ => {}
+        }
+    } else if *ty == Type::BYTEA {
+        if let Value::Bytes(b) = v {
+            return b.clone();
+        }
+    }
+    // TEXT/VARCHAR/NUMERIC/etc. (binary form == UTF-8 text) and any unconverted value.
+    value_to_text(v).into_bytes()
+}
+
+/// A column value prepared for the wire in both text and binary form, so the
+/// DataRowEncoder can emit whichever format the client requested in its Bind
+/// message. `encode_field` selects `to_sql_text` or `to_sql` from the column's
+/// FieldInfo format.
+#[derive(Debug)]
+struct WireValue {
+    text: String,
+    binary: Vec<u8>,
+}
+
+impl WireValue {
+    fn new(v: &Value, ty: &Type) -> Self {
+        Self {
+            text: value_to_text(v),
+            binary: value_to_binary(v, ty),
+        }
+    }
+}
+
+impl ToSqlText for WireValue {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.put_slice(self.text.as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
+impl ToSql for WireValue {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        out.put_slice(&self.binary);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+
+    fn to_sql_checked(
+        &self,
+        ty: &Type,
+        out: &mut bytes::BytesMut,
+    ) -> Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        self.to_sql(ty, out)
     }
 }
 
@@ -1883,7 +2031,11 @@ impl DbExtendedQueryHandler {
         }
     }
 
-    async fn execute_one_async<'a>(&self, sql: &str) -> Result<Response<'a>, PgWireError> {
+    async fn execute_one_async<'a>(
+        &self,
+        sql: &str,
+        result_format: Option<&Format>,
+    ) -> Result<Response<'a>, PgWireError> {
         let preprocessed = preprocess_sql(sql);
         if let Some(intercepted) = intercept_system_query(&preprocessed, &self.db) {
             return Ok(intercepted);
@@ -1900,7 +2052,7 @@ impl DbExtendedQueryHandler {
                 return Err(engine_err_to_pgwire(err));
             }
         };
-        execute_sql_result(result, &self.state, &self.db).map_err(|e| {
+        execute_sql_result(result, &self.state, &self.db, result_format).map_err(|e| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_string(),
                 "42000".to_string(),
@@ -2114,7 +2266,10 @@ impl ExtendedQueryHandler for DbExtendedQueryHandler {
 
         self.metrics
             .record_query(QueryKind::from_sql(&resolved_sql));
-        match self.execute_one_async(&resolved_sql).await {
+        match self
+            .execute_one_async(&resolved_sql, Some(&portal.result_column_format))
+            .await
+        {
             Ok(resp) => Ok(resp),
             Err(pg_err) => {
                 self.metrics.record_query_error();
@@ -2595,4 +2750,54 @@ async fn drain_active_connections(metrics: &Metrics, grace: std::time::Duration)
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     info!("all pgwire connections drained");
+}
+
+#[cfg(test)]
+mod binary_encoding_tests {
+    use super::{value_to_binary, PG_EPOCH_OFFSET_US};
+    use pgwire::api::Type;
+    use rust_dst_db::query::expr::{parse_uuid_str, Value};
+
+    // Regression: the engine stores UUID columns as Value::Text literals, so a
+    // type-driven binary encoding must emit 16 bytes, not the 36-char string.
+    // (sqlx requests binary results; the text form caused "expected 16, found 36".)
+    #[test]
+    fn uuid_text_value_encodes_as_16_bytes() {
+        let s = "550e8400-e29b-41d4-a716-446655440000";
+        let out = value_to_binary(&Value::Text(s.to_string()), &Type::UUID);
+        assert_eq!(out.len(), 16);
+        assert_eq!(out, parse_uuid_str(s).unwrap().to_vec());
+    }
+
+    #[test]
+    fn native_uuid_value_encodes_as_16_bytes() {
+        let bytes = [7u8; 16];
+        assert_eq!(value_to_binary(&Value::Uuid(bytes), &Type::UUID), bytes.to_vec());
+    }
+
+    #[test]
+    fn bool_encodes_as_single_byte() {
+        assert_eq!(value_to_binary(&Value::Bool(true), &Type::BOOL), vec![1]);
+        assert_eq!(value_to_binary(&Value::Bool(false), &Type::BOOL), vec![0]);
+        assert_eq!(value_to_binary(&Value::Text("t".into()), &Type::BOOL), vec![1]);
+    }
+
+    #[test]
+    fn int8_encodes_big_endian() {
+        let expected = 42i64.to_be_bytes().to_vec();
+        assert_eq!(value_to_binary(&Value::Int64(42), &Type::INT8), expected);
+        assert_eq!(value_to_binary(&Value::Text("42".into()), &Type::INT8), expected);
+    }
+
+    #[test]
+    fn timestamp_encodes_pg_epoch_micros() {
+        // Unix micros at the PG epoch (2000-01-01) must encode to 0.
+        let out = value_to_binary(&Value::Timestamp(PG_EPOCH_OFFSET_US), &Type::TIMESTAMP);
+        assert_eq!(out, 0i64.to_be_bytes().to_vec());
+    }
+
+    #[test]
+    fn text_encodes_as_utf8() {
+        assert_eq!(value_to_binary(&Value::Text("hello".into()), &Type::TEXT), b"hello".to_vec());
+    }
 }
