@@ -1112,3 +1112,62 @@ fn c_next_ts_survives_snapshot_roundtrip() {
         _ => panic!("expected Query"),
     }
 }
+
+// ─── ALTER TABLE Tests ────────────────────────────────────────────────────────
+
+#[test]
+fn alter_table_add_column_preserves_existing_rows() {
+    let dir = tmp_dir("alter_add_col");
+    let db = Database::open(&dir).unwrap();
+    db.execute_sql("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)").unwrap();
+    db.execute_sql("INSERT INTO users (id, name) VALUES (1, 'Alice')").unwrap();
+    db.execute_sql("ALTER TABLE users ADD COLUMN age BIGINT").unwrap();
+
+    // The pre-ALTER row reads NULL for the new column; prior columns intact.
+    match db.execute_sql("SELECT id, name, age FROM users").unwrap() {
+        SqlResult::Query { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get("name"), Some(&Value::Text("Alice".into())));
+            assert_eq!(rows[0].get("age"), Some(&Value::Null));
+        }
+        _ => panic!("expected query result"),
+    }
+
+    // A new insert carries the added column.
+    db.execute_sql("INSERT INTO users (id, name, age) VALUES (2, 'Bob', 40)").unwrap();
+    match db.execute_sql("SELECT age FROM users WHERE id = 2").unwrap() {
+        SqlResult::Query { rows, .. } => assert_eq!(rows[0].get("age"), Some(&Value::Int64(40))),
+        _ => panic!("expected query result"),
+    }
+}
+
+#[test]
+fn alter_add_column_with_default_persists_across_reopen() {
+    let dir = tmp_dir("alter_default_reopen");
+    {
+        let db = Database::open(&dir).unwrap();
+        db.execute_sql("CREATE TABLE t (id BIGINT NOT NULL)").unwrap();
+        db.execute_sql("INSERT INTO t (id) VALUES (1)").unwrap();
+        db.execute_sql("ALTER TABLE t ADD COLUMN status TEXT DEFAULT 'new'").unwrap();
+    } // drop -> close
+    let db = Database::open(&dir).unwrap(); // WAL replay restores the schema change
+    match db.execute_sql("SELECT id, status FROM t").unwrap() {
+        SqlResult::Query { rows, .. } => {
+            assert_eq!(rows[0].get("status"), Some(&Value::Text("new".into())),
+                "old row reads the column DEFAULT after reopen");
+        }
+        _ => panic!("expected query result"),
+    }
+}
+
+#[test]
+fn alter_table_error_cases() {
+    let dir = tmp_dir("alter_errors");
+    let db = Database::open(&dir).unwrap();
+    db.execute_sql("CREATE TABLE t (id BIGINT, name TEXT)").unwrap();
+    assert!(db.execute_sql("ALTER TABLE nope ADD COLUMN x BIGINT").is_err(), "unknown table");
+    assert!(db.execute_sql("ALTER TABLE t ADD COLUMN name TEXT").is_err(), "duplicate column");
+    assert!(db.execute_sql("ALTER TABLE t DROP COLUMN name").is_err(), "unsupported op");
+    assert!(db.execute_sql("ALTER TABLE t ADD COLUMN a BIGINT, ADD COLUMN b BIGINT").is_err(),
+        "multiple ADD COLUMN per statement is rejected in v1");
+}
