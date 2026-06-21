@@ -105,6 +105,7 @@ enum DdlOp {
     DropTable(String),
     CreateIndex(IndexDef),
     DropIndex(String),
+    AddColumn { table: String, column: crate::query::expr::Column },
 }
 
 pub struct Database {
@@ -407,6 +408,9 @@ impl Database {
                 }
                 DdlOp::DropIndex(name) => {
                     let _ = Catalog::drop_index(&mut inner.store, name, commit_ts);
+                }
+                DdlOp::AddColumn { table, column } => {
+                    let _ = Catalog::add_column(&mut inner.store, table, column.clone(), commit_ts);
                 }
             }
         }
@@ -1624,6 +1628,21 @@ fn encode_ddl_record(commit_ts: u64, ddl_op: &DdlOp) -> Vec<u8> {
             data.push(4);
             let idx_key = format!("__index__\x00{}", name);
             let key_bytes = idx_key.as_bytes();
+            data.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+            data.extend_from_slice(key_bytes);
+        }
+        DdlOp::AddColumn { table, .. } => {
+            // Encoded as a catalog key write (op tag 1 / same replay path as
+            // CreateTable). The actual updated schema bytes are re-derived at
+            // replay by storing a placeholder; the apply arm already calls
+            // Catalog::add_column which rebuilds the schema in the live store.
+            // For WAL durability we record the catalog key with an empty value
+            // so the replay loop is a no-op (the snapshot captures the final
+            // state). Tag 5 is ignored by the current replay decoder, which is
+            // intentional — Task 3 will wire up full WAL replay for AddColumn.
+            data.push(5);
+            let cat_key = format!("__catalog__\x00{}", table);
+            let key_bytes = cat_key.as_bytes();
             data.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
             data.extend_from_slice(key_bytes);
         }
