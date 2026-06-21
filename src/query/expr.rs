@@ -602,20 +602,29 @@ impl Schema {
     }
 
     /// Decode bytes back to a Row using this schema.
+    ///
+    /// Forward-compatible: a stored row may have FEWER columns than the current
+    /// schema (it was written before an `ALTER TABLE ADD COLUMN`). The present
+    /// values fill the leading columns; each remaining column is filled from its
+    /// `default` (or `Null`). A row with MORE columns than the schema is rejected
+    /// (corruption — this engine never drops columns).
     pub fn decode_row(&self, data: &[u8]) -> Option<Row> {
         let mut pos = 0;
         let count = u32::from_le_bytes(data.get(pos..pos + 4)?.try_into().ok()?) as usize;
         pos += 4;
 
-        if count != self.columns.len() {
+        if count > self.columns.len() {
             return None;
         }
 
         let mut row = BTreeMap::new();
-        for col in &self.columns {
+        for col in &self.columns[..count] {
             let (val, consumed) = Value::decode(&data[pos..])?;
             pos += consumed;
             row.insert(col.name.clone(), val);
+        }
+        for col in &self.columns[count..] {
+            row.insert(col.name.clone(), col.default.clone().unwrap_or(Value::Null));
         }
         Some(row)
     }
@@ -1220,4 +1229,40 @@ pub fn vec_dot_product(a: &[f32], b: &[f32]) -> Option<f64> {
         sum += a[i] as f64 * b[i] as f64;
     }
     Some(sum)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_row_pads_added_columns_with_default_or_null() {
+        use std::collections::BTreeMap;
+        // A row written under a 2-column schema.
+        let old = Schema::new("t", vec![
+            Column::new("id", ValueType::Int64),
+            Column::new("name", ValueType::Text),
+        ]);
+        let mut r: BTreeMap<String, Value> = BTreeMap::new();
+        r.insert("id".to_string(), Value::Int64(1));
+        r.insert("name".to_string(), Value::Text("a".into()));
+        let bytes = old.encode_row(&r);
+
+        // Decoded under a 4-column schema: the two new trailing columns pad.
+        let new = Schema::new("t", vec![
+            Column::new("id", ValueType::Int64),
+            Column::new("name", ValueType::Text),
+            Column::new("assignee", ValueType::Int64),                              // no default -> NULL
+            Column::new("flag", ValueType::Text).with_default(Value::Text("x".into())),
+        ]);
+        let decoded = new.decode_row(&bytes).expect("short row must decode");
+        assert_eq!(decoded.get("id"), Some(&Value::Int64(1)));
+        assert_eq!(decoded.get("name"), Some(&Value::Text("a".into())));
+        assert_eq!(decoded.get("assignee"), Some(&Value::Null), "no default -> NULL");
+        assert_eq!(decoded.get("flag"), Some(&Value::Text("x".into())), "default applied");
+
+        // A row with MORE stored columns than the schema is rejected (corruption).
+        let one = Schema::new("t", vec![Column::new("id", ValueType::Int64)]);
+        assert!(one.decode_row(&bytes).is_none(), "count > len -> None");
+    }
 }
