@@ -105,6 +105,7 @@ enum DdlOp {
     DropTable(String),
     CreateIndex(IndexDef),
     DropIndex(String),
+    AddColumn { table: String, column: crate::query::expr::Column },
 }
 
 pub struct Database {
@@ -383,7 +384,34 @@ impl Database {
         }
 
         for ddl_op in &txn.ddl_ops {
-            let wal_data = encode_ddl_record(commit_ts, ddl_op);
+            let wal_data = if let DdlOp::AddColumn { table, column } = ddl_op {
+                // Build the merged schema from the current catalog state, then
+                // emit a tag-1 record (same layout as CreateTable) so that the
+                // WAL replay loop upserts the updated catalog entry on reopen.
+                // We read the store immutably into locals first, then append.
+                let merged = Catalog::get_table(&inner.store, table, commit_ts.saturating_sub(1))
+                    .map(|mut s| {
+                        s.columns.push(column.clone());
+                        s
+                    });
+                if let Some(merged_schema) = merged {
+                    let mut data = Vec::new();
+                    data.push(WAL_DDL);
+                    data.extend_from_slice(&commit_ts.to_le_bytes());
+                    data.push(1); // tag-1 = catalog upsert (same as CreateTable)
+                    let cat_key = format!("__catalog__\x00{}", table);
+                    let key_bytes = cat_key.as_bytes();
+                    data.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+                    data.extend_from_slice(key_bytes);
+                    data.extend_from_slice(&catalog::encode_schema_public(&merged_schema));
+                    data
+                } else {
+                    // Table not found (shouldn't happen at commit); skip WAL record.
+                    continue;
+                }
+            } else {
+                encode_ddl_record(commit_ts, ddl_op)
+            };
             inner
                 .wal
                 .append_sync(&wal_data)
@@ -407,6 +435,9 @@ impl Database {
                 }
                 DdlOp::DropIndex(name) => {
                     let _ = Catalog::drop_index(&mut inner.store, name, commit_ts);
+                }
+                DdlOp::AddColumn { table, column } => {
+                    let _ = Catalog::add_column(&mut inner.store, table, column.clone(), commit_ts);
                 }
             }
         }
@@ -482,6 +513,9 @@ impl Database {
         if upper.starts_with("DROP TABLE") {
             return self.execute_drop_table(trimmed);
         }
+        if upper.starts_with("ALTER TABLE") {
+            return self.execute_alter_table(trimmed);
+        }
         if upper.starts_with("INSERT") {
             return self.execute_insert(trimmed);
         }
@@ -508,7 +542,7 @@ impl Database {
         if upper == "ROLLBACK" {
             return Ok(SqlResult::Rollback);
         }
-        if upper.starts_with("CREATE") || upper.starts_with("DROP") {
+        if upper.starts_with("CREATE") || upper.starts_with("DROP") || upper.starts_with("ALTER") {
             return Err(DbError::Sql(
                 "DDL statements inside explicit transactions are not yet supported".into(),
             ));
@@ -585,6 +619,91 @@ impl Database {
             }
             _ => Err(DbError::Sql("expected CREATE TABLE".into())),
         }
+    }
+
+    fn execute_alter_table(&self, sql: &str) -> DbResult<SqlResult> {
+        use sqlparser::ast::{AlterTableOperation, ColumnOption, Statement};
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql)
+            .map_err(|e| DbError::Sql(format!("parse error: {}", e)))?;
+        if stmts.len() != 1 {
+            return Err(DbError::Sql("expected one statement".into()));
+        }
+        let (table_name, operations) = match &stmts[0] {
+            Statement::AlterTable { name, operations, .. } => (name.to_string(), operations),
+            _ => return Err(DbError::Sql("expected ALTER TABLE".into())),
+        };
+
+        // Translate each ADD COLUMN op to a catalog Column (reuse CreateTable's mapping).
+        let mut new_columns: Vec<crate::query::expr::Column> = Vec::new();
+        for op in operations {
+            match op {
+                AlterTableOperation::AddColumn { column_def, .. } => {
+                    let col_type = sql_type_to_value_type(&column_def.data_type);
+                    let mut col =
+                        crate::query::expr::Column::new(column_def.name.value.clone(), col_type);
+                    for opt in &column_def.options {
+                        match &opt.option {
+                            ColumnOption::NotNull => col = col.not_null(),
+                            ColumnOption::Default(expr) => {
+                                if let Ok(value) = sql_expr_to_value(expr) {
+                                    if !value.is_null() {
+                                        col = col.with_default(value);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    new_columns.push(col);
+                }
+                other => {
+                    return Err(DbError::Sql(format!("unsupported ALTER operation: {:?}", other)));
+                }
+            }
+        }
+        // v1 supports exactly one ADD COLUMN per statement. Multiple ADD COLUMNs
+        // in one statement are rejected: the commit-time WAL encoding and apply
+        // both read the pre-commit schema, so they would not accumulate across
+        // ops (the last write would clobber the others). Single-add is all the
+        // downstream migration needs; multi-add is deferred.
+        if new_columns.len() != 1 {
+            return Err(DbError::Sql(
+                "exactly one ADD COLUMN per ALTER statement is supported".into(),
+            ));
+        }
+
+        let txn_id = self.begin()?;
+        {
+            let mut inner = self.lock_inner()?;
+            let snapshot_ts = inner.active.get(&txn_id).unwrap().start_ts;
+            let schema = match Catalog::get_table(&inner.store, &table_name, snapshot_ts) {
+                Some(s) => s,
+                None => {
+                    inner.active.remove(&txn_id);
+                    return Err(DbError::NoSuchTable(table_name));
+                }
+            };
+            // Reject duplicates against the existing schema AND within this statement.
+            let mut seen: std::collections::HashSet<String> =
+                schema.columns.iter().map(|c| c.name.clone()).collect();
+            for col in &new_columns {
+                if !seen.insert(col.name.clone()) {
+                    inner.active.remove(&txn_id);
+                    return Err(DbError::Sql(format!("column '{}' already exists", col.name)));
+                }
+            }
+            let txn = inner.active.get_mut(&txn_id).unwrap();
+            for col in new_columns {
+                txn.ddl_ops.push(DdlOp::AddColumn {
+                    table: table_name.clone(),
+                    column: col,
+                });
+            }
+        }
+        self.commit(txn_id)?;
+        Ok(SqlResult::Execute(0))
     }
 
     fn execute_drop_table(&self, sql: &str) -> DbResult<SqlResult> {
@@ -1626,6 +1745,14 @@ fn encode_ddl_record(commit_ts: u64, ddl_op: &DdlOp) -> Vec<u8> {
             let key_bytes = idx_key.as_bytes();
             data.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
             data.extend_from_slice(key_bytes);
+        }
+        DdlOp::AddColumn { .. } => {
+            // AddColumn is encoded inline in the commit WAL-encode loop (which
+            // has access to inner.store) so it can embed the fully merged schema
+            // as a tag-1 catalog upsert — identical to the CreateTable replay
+            // path.  This arm is therefore never reached; mark it unreachable to
+            // keep the match exhaustive and document the invariant.
+            unreachable!("AddColumn is encoded inline in commit with the merged schema")
         }
     }
     data

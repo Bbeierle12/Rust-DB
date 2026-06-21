@@ -307,6 +307,25 @@ impl Catalog {
             .collect()
     }
 
+    /// Append a column to an existing table's schema. Preserves existing rows:
+    /// only the catalog entry changes (old rows pad via `Schema::decode_row`).
+    pub fn add_column(
+        store: &mut MvccStore,
+        table_name: &str,
+        column: Column,
+        commit_ts: u64,
+    ) -> Result<(), String> {
+        let mut schema = Self::get_table(store, table_name, commit_ts.saturating_sub(1))
+            .ok_or_else(|| format!("table '{table_name}' not found"))?;
+        if schema.columns.iter().any(|c| c.name == column.name) {
+            return Err(format!("column '{}' already exists", column.name));
+        }
+        schema.columns.push(column);
+        let key = catalog_key(table_name);
+        store.write(key, commit_ts, Some(encode_schema(&schema)));
+        Ok(())
+    }
+
     /// Drop a table by writing a tombstone.
     pub fn drop_table(
         store: &mut MvccStore,
@@ -509,6 +528,26 @@ mod tests {
         let user_indexes = Catalog::list_indexes_for_table(&store, "users", 2);
         assert_eq!(user_indexes.len(), 1);
         assert_eq!(user_indexes[0].name, "idx_users_name");
+    }
+
+    #[test]
+    fn add_column_appends_and_rejects_dup_and_unknown() {
+        let mut store = MvccStore::new();
+        let schema = Schema::new("users", vec![
+            Column::new("id", ValueType::Int64).not_null(),
+            Column::new("name", ValueType::Text),
+        ]);
+        Catalog::create_table(&mut store, &schema, 1).unwrap();
+
+        Catalog::add_column(&mut store, "users", Column::new("age", ValueType::Int64), 2).unwrap();
+        let s = Catalog::get_table(&store, "users", 2).unwrap();
+        assert_eq!(s.columns.len(), 3);
+        assert_eq!(s.columns[2].name, "age");
+
+        // Duplicate column name -> error.
+        assert!(Catalog::add_column(&mut store, "users", Column::new("age", ValueType::Int64), 3).is_err());
+        // Unknown table -> error.
+        assert!(Catalog::add_column(&mut store, "nope", Column::new("x", ValueType::Int64), 4).is_err());
     }
 
     #[test]

@@ -287,6 +287,8 @@ fn alter_table_error_cases() {
     assert!(db.execute_sql("ALTER TABLE nope ADD COLUMN x BIGINT").is_err(), "unknown table");
     assert!(db.execute_sql("ALTER TABLE t ADD COLUMN name TEXT").is_err(), "duplicate column");
     assert!(db.execute_sql("ALTER TABLE t DROP COLUMN name").is_err(), "unsupported op");
+    assert!(db.execute_sql("ALTER TABLE t ADD COLUMN a BIGINT, ADD COLUMN b BIGINT").is_err(),
+        "multiple ADD COLUMN per statement is rejected in v1");
 }
 ```
 
@@ -356,8 +358,15 @@ In `execute_sql_in_txn` (~`:511`), extend the DDL prefix check so ALTER is route
                 }
             }
         }
-        if new_columns.is_empty() {
-            return Err(DbError::Sql("ALTER TABLE requires at least one ADD COLUMN".into()));
+        // v1 supports exactly one ADD COLUMN per statement. Multiple ADD COLUMNs
+        // in one statement are rejected: the commit-time WAL encoding and apply
+        // both read the pre-commit schema, so they would not accumulate across
+        // ops (the last write would clobber the others). Single-add is all the
+        // downstream migration needs; multi-add is deferred.
+        if new_columns.len() != 1 {
+            return Err(DbError::Sql(
+                "exactly one ADD COLUMN per ALTER statement is supported".into(),
+            ));
         }
 
         let txn_id = self.begin()?;
@@ -417,7 +426,7 @@ git -c user.name="Bbeierle12" -c user.email="bbeierle21@gmail.com" commit -m "fe
 - Preserve mechanism — `decode_row` pads short rows from default/NULL, rejects over-long → Task 1. ✓
 - Durability via existing txn→WAL DDL commit → Task 2 apply arm + Task 3 commit; verified by the reopen test (Task 3). ✓
 - Errors (unknown table, duplicate column, unsupported op) → Task 3 handler + test. ✓
-- Multiple ADD COLUMN in one statement → Task 3 loops `operations` (the within-statement dup check covers it). ✓
+- Multiple ADD COLUMN in one statement → **rejected** with a clear error in Task 3 (v1 supports exactly one; multi-add deferred because commit-time WAL/apply read the pre-commit schema and would not accumulate). ✓
 - Out-of-scope items (DROP/RENAME/type change, non-constant defaults, eager rewrite, JOIN) → none implemented. ✓
 
 **Placeholder scan:** No TBD/TODO. Every code step shows complete code; every test step shows the assertions and the exact `cargo test` command + expected outcome.

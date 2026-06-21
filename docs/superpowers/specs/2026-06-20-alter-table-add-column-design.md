@@ -180,7 +180,8 @@ Engine tests (Rust-DB `tests/` and/or `#[cfg(test)]` using the in-process
    → reads back the inserted value; an `INSERT` omitting `c` uses its default/NULL.
 4. **Persists across reopen:** ALTER, drop the `Database`, `open` the same path →
    schema has the new column and rows (old + new) read correctly (WAL replay).
-5. **Multiple ADD COLUMN in one statement** stage and apply both.
+5. **Multiple ADD COLUMN in one statement is rejected** with a clear error (v1
+   supports exactly one per statement — see Out of scope).
 6. **Errors:** ALTER on an unknown table → `NoSuchTable`; adding an existing
    column name → error; `ALTER TABLE t DROP COLUMN c` → unsupported-op error.
 7. **Round-trip unit test** for the relaxed `decode_row`: a buffer with `count < len`
@@ -194,5 +195,8 @@ Engine tests (Rust-DB `tests/` and/or `#[cfg(test)]` using the in-process
 - Non-constant column defaults (`now()`, `gen_random_uuid()`) — already ignored by
   the shared `CreateTable` default logic; same behavior here.
 - Eager row rewrite / backfill jobs.
+- Multiple `ADD COLUMN` in a single `ALTER` statement — v1 supports exactly one
+  per statement (commit-time WAL/apply read the pre-commit schema and would not
+  accumulate across ops). Issue separate `ALTER` statements; multi-add is future.
 - Any `chore-loop-backend` change to use the new columns (separate plan).
 - `JOIN` (already supported).
