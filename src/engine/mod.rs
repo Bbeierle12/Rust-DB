@@ -384,7 +384,34 @@ impl Database {
         }
 
         for ddl_op in &txn.ddl_ops {
-            let wal_data = encode_ddl_record(commit_ts, ddl_op);
+            let wal_data = if let DdlOp::AddColumn { table, column } = ddl_op {
+                // Build the merged schema from the current catalog state, then
+                // emit a tag-1 record (same layout as CreateTable) so that the
+                // WAL replay loop upserts the updated catalog entry on reopen.
+                // We read the store immutably into locals first, then append.
+                let merged = Catalog::get_table(&inner.store, table, commit_ts.saturating_sub(1))
+                    .map(|mut s| {
+                        s.columns.push(column.clone());
+                        s
+                    });
+                if let Some(merged_schema) = merged {
+                    let mut data = Vec::new();
+                    data.push(WAL_DDL);
+                    data.extend_from_slice(&commit_ts.to_le_bytes());
+                    data.push(1); // tag-1 = catalog upsert (same as CreateTable)
+                    let cat_key = format!("__catalog__\x00{}", table);
+                    let key_bytes = cat_key.as_bytes();
+                    data.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
+                    data.extend_from_slice(key_bytes);
+                    data.extend_from_slice(&catalog::encode_schema_public(&merged_schema));
+                    data
+                } else {
+                    // Table not found (shouldn't happen at commit); skip WAL record.
+                    continue;
+                }
+            } else {
+                encode_ddl_record(commit_ts, ddl_op)
+            };
             inner
                 .wal
                 .append_sync(&wal_data)
@@ -1631,20 +1658,13 @@ fn encode_ddl_record(commit_ts: u64, ddl_op: &DdlOp) -> Vec<u8> {
             data.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
             data.extend_from_slice(key_bytes);
         }
-        DdlOp::AddColumn { table, .. } => {
-            // Encoded as a catalog key write (op tag 1 / same replay path as
-            // CreateTable). The actual updated schema bytes are re-derived at
-            // replay by storing a placeholder; the apply arm already calls
-            // Catalog::add_column which rebuilds the schema in the live store.
-            // For WAL durability we record the catalog key with an empty value
-            // so the replay loop is a no-op (the snapshot captures the final
-            // state). Tag 5 is ignored by the current replay decoder, which is
-            // intentional — Task 3 will wire up full WAL replay for AddColumn.
-            data.push(5);
-            let cat_key = format!("__catalog__\x00{}", table);
-            let key_bytes = cat_key.as_bytes();
-            data.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes());
-            data.extend_from_slice(key_bytes);
+        DdlOp::AddColumn { .. } => {
+            // AddColumn is encoded inline in the commit WAL-encode loop (which
+            // has access to inner.store) so it can embed the fully merged schema
+            // as a tag-1 catalog upsert — identical to the CreateTable replay
+            // path.  This arm is therefore never reached; mark it unreachable to
+            // keep the match exhaustive and document the invariant.
+            unreachable!("AddColumn is encoded inline in commit with the merged schema")
         }
     }
     data
