@@ -11,6 +11,32 @@ use crate::traits::state_machine::StateMachine;
 const WAL_OP_PUT: u8 = 1;
 const WAL_OP_DELETE: u8 = 2;
 
+/// Page-access trace capture (feature `trace-capture`).
+///
+/// Records the page accesses a demand-paging B-tree would make: every
+/// logical node read/write through `nodes`. Two paths are deliberately NOT
+/// traced: `find_parent` (a full-map sweep standing in for parent pointers —
+/// a paging engine would keep the descent path instead) and `persist_pages`
+/// (write-back serialization, which belongs to the buffer pool, not to the
+/// access pattern).
+#[cfg(feature = "trace-capture")]
+pub mod trace {
+    /// A single page access.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TraceEvent {
+        pub op: TraceOp,
+        pub page_id: u64,
+        /// 0 = leaf, 1 = internal — same tags as the serialized page format.
+        pub page_type: u8,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TraceOp {
+        Read,
+        Write,
+    }
+}
+
 /// B+tree engine state machine.
 ///
 /// Maintains an in-memory B+tree and persists changes through the WAL
@@ -38,6 +64,10 @@ pub struct BTreeEngine {
     max_internal: usize,
     /// Whether the engine has been initialized (root created).
     initialized: bool,
+    /// Captured page-access trace. RefCell because reads (`get`, `scan`)
+    /// take `&self` but must still record accesses.
+    #[cfg(feature = "trace-capture")]
+    trace: std::cell::RefCell<Vec<trace::TraceEvent>>,
 }
 
 impl BTreeEngine {
@@ -57,7 +87,46 @@ impl BTreeEngine {
             max_leaf: cfg.btree_max_leaf_entries,
             max_internal: cfg.btree_max_internal_keys,
             initialized: false,
+            #[cfg(feature = "trace-capture")]
+            trace: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// Record a read access to a page (no-op without `trace-capture`).
+    #[inline]
+    fn trace_r(&self, page_id: PageId) {
+        #[cfg(feature = "trace-capture")]
+        self.trace_push(trace::TraceOp::Read, page_id);
+        #[cfg(not(feature = "trace-capture"))]
+        let _ = page_id;
+    }
+
+    /// Record a write access to a page (no-op without `trace-capture`).
+    #[inline]
+    fn trace_w(&self, page_id: PageId) {
+        #[cfg(feature = "trace-capture")]
+        self.trace_push(trace::TraceOp::Write, page_id);
+        #[cfg(not(feature = "trace-capture"))]
+        let _ = page_id;
+    }
+
+    #[cfg(feature = "trace-capture")]
+    fn trace_push(&self, op: trace::TraceOp, page_id: PageId) {
+        let page_type = match self.nodes.get(&page_id) {
+            Some(BTreeNode::Internal { .. }) => 1,
+            _ => 0,
+        };
+        self.trace.borrow_mut().push(trace::TraceEvent {
+            op,
+            page_id: page_id.0,
+            page_type,
+        });
+    }
+
+    /// Drain and return the captured page-access trace.
+    #[cfg(feature = "trace-capture")]
+    pub fn take_trace(&self) -> Vec<trace::TraceEvent> {
+        std::mem::take(&mut *self.trace.borrow_mut())
     }
 
     fn ensure_root(&mut self) {
@@ -65,6 +134,7 @@ impl BTreeEngine {
             let page_id = self.allocator.alloc();
             let root = BTreeNode::new_leaf(page_id);
             self.nodes.insert(page_id, root);
+            self.trace_w(page_id);
             self.root = Some(page_id);
             self.initialized = true;
         }
@@ -77,6 +147,7 @@ impl BTreeEngine {
 
         loop {
             let node = self.nodes.get(&current)?;
+            self.trace_r(current);
             match node {
                 BTreeNode::Leaf { .. } => return Some(current),
                 BTreeNode::Internal { keys, children, .. } => {
@@ -92,6 +163,7 @@ impl BTreeEngine {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         let leaf_id = self.find_leaf(key)?;
         let node = self.nodes.get(&leaf_id)?;
+        self.trace_r(leaf_id);
 
         if let BTreeNode::Leaf { entries, .. } = node {
             entries
@@ -115,6 +187,7 @@ impl BTreeEngine {
         };
 
         // Insert into the leaf.
+        self.trace_w(leaf_id);
         if let Some(BTreeNode::Leaf { entries, .. }) = self.nodes.get_mut(&leaf_id) {
             match entries.binary_search_by(|(k, _)| k.as_slice().cmp(&key)) {
                 Ok(idx) => {
@@ -144,6 +217,7 @@ impl BTreeEngine {
         };
 
         let found;
+        self.trace_w(leaf_id);
         if let Some(BTreeNode::Leaf { entries, .. }) = self.nodes.get_mut(&leaf_id) {
             if let Ok(idx) = entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
                 entries.remove(idx);
@@ -192,6 +266,7 @@ impl BTreeEngine {
         let Some(node) = self.nodes.get(&pid) else {
             return;
         };
+        self.trace_r(pid);
 
         match node {
             BTreeNode::Leaf { entries, .. } => {
@@ -207,6 +282,7 @@ impl BTreeEngine {
 
     /// Check if a node needs splitting. If so, split it and propagate up.
     fn maybe_split(&mut self, page_id: PageId, dirty: &mut Vec<PageId>) {
+        self.trace_r(page_id);
         let needs_split = match self.nodes.get(&page_id) {
             Some(BTreeNode::Leaf { entries, .. }) => entries.len() > self.max_leaf,
             Some(BTreeNode::Internal { keys, .. }) => keys.len() > self.max_internal,
@@ -217,6 +293,7 @@ impl BTreeEngine {
             return;
         }
 
+        // Same logical access as the needs_split check above — not re-traced.
         let node = match self.nodes.get(&page_id) {
             Some(n) => n.clone(),
             None => return, // Node disappeared; skip split.
@@ -246,6 +323,8 @@ impl BTreeEngine {
 
                 self.nodes.insert(leaf_id, left_leaf);
                 self.nodes.insert(right_id, right_leaf);
+                self.trace_w(leaf_id);
+                self.trace_w(right_id);
                 dirty.push(right_id);
 
                 // Insert separator into parent.
@@ -279,6 +358,8 @@ impl BTreeEngine {
 
                 self.nodes.insert(int_id, left_node);
                 self.nodes.insert(right_id, right_node);
+                self.trace_w(int_id);
+                self.trace_w(right_id);
                 dirty.push(right_id);
 
                 self.insert_into_parent(int_id, separator, right_id, dirty);
@@ -308,11 +389,13 @@ impl BTreeEngine {
                     children: vec![left_id, right_id],
                 };
                 self.nodes.insert(new_root_id, new_root);
+                self.trace_w(new_root_id);
                 self.root = Some(new_root_id);
                 dirty.push(new_root_id);
             }
             Some(parent_id) => {
                 // Insert into existing parent.
+                self.trace_w(parent_id);
                 if let Some(BTreeNode::Internal { keys, children, .. }) =
                     self.nodes.get_mut(&parent_id)
                 {

@@ -15,6 +15,8 @@ required-features = ["server"]
 [features]
 pgwire = ["dep:pgwire", "dep:tokio", "dep:async-trait", "dep:futures"]
 python = ["dep:pyo3"]
+# Capture BTreeEngine page-access traces (eviction-policy research loop).
+trace-capture = []
 server = ["pgwire", "dep:postgres-types", "dep:tracing", "dep:tracing-subscriber", "dep:clap", "dep:axum", "dep:serde", "dep:serde_json", "dep:tower-http", "dep:uuid", "dep:toml", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:axum-server", "dep:arc-swap"]
 
 [dependencies]
