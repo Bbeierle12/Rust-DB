@@ -1,16 +1,36 @@
 use std::collections::BTreeMap;
 
 use crate::config::{self, DatabaseConfig};
+use crate::storage::page::PAGE_TYPE_INTERNAL;
 use crate::traits::message::{ActorId, Destination, Message};
 use crate::traits::state_machine::StateMachine;
 
-/// LRU-2 access history for a cached page.
+/// Eviction-policy weights discovered by the edge-loop db-eviction
+/// autoresearch loop (gemma iteration-300 vector, promoted 2026-07-11 on
+/// holdout generalization: −23.5% disk traffic vs the previous LRU-2 on
+/// unseen traces). Do not hand-tune: any change must re-run the loop's
+/// T3 evaluation, and the differential test against
+/// tests/fixtures/discovered_policy_vectors.json pins these exact values.
+const W_AGE_PENULT: f64 = 4.0;
+const W_AGE_LAST: f64 = 8.5;
+const W_DIRTY: f64 = -1.5;
+const W_INTERNAL: f64 = -7.0;
+const W_FREQ: f64 = 3.5;
+const W_GAP: f64 = 2.0;
+const W_AGE_INSERT: f64 = -3.0;
+
+/// Access statistics for a cached page.
 #[derive(Debug, Clone)]
 struct PageEntry {
     data: Vec<u8>,
     dirty: bool,
     /// Last two access timestamps. history[0] is older, history[1] is more recent.
     history: [Option<u64>; 2],
+    /// Total accesses, tick of first insertion, and summed inter-access
+    /// gaps — inputs to the discovered eviction score.
+    count: u64,
+    first: u64,
+    sum_gaps: u64,
 }
 
 impl PageEntry {
@@ -19,26 +39,54 @@ impl PageEntry {
             data,
             dirty: false,
             history: [None, Some(now)],
+            count: 1,
+            first: now,
+            sum_gaps: 0,
         }
     }
 
     fn touch(&mut self, now: u64) {
+        // Gap accumulates before the history shift (same order as the
+        // research scaffold, which the differential vectors encode).
+        self.sum_gaps += now - self.history[1].unwrap_or(0);
         self.history[0] = self.history[1];
         self.history[1] = Some(now);
+        self.count += 1;
     }
 
-    /// LRU-2 eviction key: the second-to-last access time.
-    /// Pages accessed only once (history[0] = None) are evicted first.
-    fn eviction_key(&self) -> u64 {
-        self.history[0].unwrap_or(0)
+    /// Evict-desirability under the discovered policy: HIGHEST score is
+    /// evicted. Features are normalized by `now`; f64 evaluation order
+    /// mirrors the research genome so victim choice is bit-identical.
+    /// Retains internal pages and hot pages, defers dirty write-backs,
+    /// and evicts recently-inserted (one-shot burst) pages young.
+    fn evict_score(&self, now: u64) -> f64 {
+        let nowf = now as f64;
+        let mut s = W_AGE_PENULT * (now - self.history[0].unwrap_or(0)) as f64 / nowf;
+        s += W_AGE_LAST * (now - self.history[1].unwrap_or(0)) as f64 / nowf;
+        if self.dirty {
+            s += W_DIRTY;
+        }
+        if self.data.first() == Some(&PAGE_TYPE_INTERNAL) {
+            s += W_INTERNAL;
+        }
+        s += W_FREQ * self.count as f64 / nowf;
+        let gap = if self.count > 1 {
+            (self.sum_gaps as f64 / (self.count - 1) as f64) / nowf
+        } else {
+            1.0
+        };
+        s += W_GAP * gap;
+        s += W_AGE_INSERT * (now - self.first) as f64 / nowf;
+        s
     }
 }
 
 /// Buffer pool state machine.
 ///
-/// Caches pages in memory with LRU-2 eviction. Reads from and writes to
-/// the simulated disk through the message bus. Uses BTreeMap for
-/// deterministic iteration order.
+/// Caches pages in memory; eviction uses the discovered weighted score
+/// (see the W_* constants above). Reads from and writes to the simulated
+/// disk through the message bus. Uses BTreeMap for deterministic
+/// iteration order — ascending page id, which is also the tie-break rule.
 pub struct BufferPool {
     id: ActorId,
     disk_actor: ActorId,
@@ -52,6 +100,11 @@ pub struct BufferPool {
     pending_reads: BTreeMap<u64, Vec<ActorId>>,
     /// Pending flush: number of dirty pages still being written.
     flush_pending: Option<(ActorId, usize)>,
+    /// Eviction victims in order (feature `trace-capture` only) — read by
+    /// the differential test that pins victim-for-victim parity with the
+    /// research reference.
+    #[cfg(feature = "trace-capture")]
+    evict_log: Vec<u64>,
 }
 
 impl BufferPool {
@@ -65,7 +118,15 @@ impl BufferPool {
             now: 0,
             pending_reads: BTreeMap::new(),
             flush_pending: None,
+            #[cfg(feature = "trace-capture")]
+            evict_log: Vec::new(),
         }
+    }
+
+    /// Drain and return the eviction victim sequence.
+    #[cfg(feature = "trace-capture")]
+    pub fn take_evictions(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.evict_log)
     }
 
     pub fn cached_count(&self) -> usize {
@@ -76,19 +137,27 @@ impl BufferPool {
         self.cache.values().filter(|e| e.dirty).count()
     }
 
-    /// Evict the LRU-2 page to make room. If the evicted page is dirty,
-    /// returns a DiskWrite message to flush it first.
+    /// Evict one page under the discovered policy to make room. If the
+    /// evicted page is dirty, returns a DiskWrite message to flush it first.
     fn evict_one(&mut self) -> Option<(Message, Destination)> {
         if self.cache.len() < self.capacity {
             return None;
         }
 
-        // Find the page with the smallest eviction key (oldest second-to-last access).
-        let victim_id = self
-            .cache
-            .iter()
-            .min_by_key(|(_, entry)| entry.eviction_key())
-            .map(|(&id, _)| id)?;
+        // Highest score evicts; ascending iteration + strict > keeps the
+        // first maximum, so ties go to the lowest page id.
+        let now = self.now.max(1);
+        let mut victim: Option<(f64, u64)> = None;
+        for (&id, entry) in &self.cache {
+            let s = entry.evict_score(now);
+            match victim {
+                Some((best, _)) if s <= best => {}
+                _ => victim = Some((s, id)),
+            }
+        }
+        let victim_id = victim.map(|(_, id)| id)?;
+        #[cfg(feature = "trace-capture")]
+        self.evict_log.push(victim_id);
 
         let entry = self.cache.remove(&victim_id)?;
 

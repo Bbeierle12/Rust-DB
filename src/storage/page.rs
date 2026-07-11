@@ -21,8 +21,8 @@ pub enum BTreeNode {
     },
 }
 
-const PAGE_TYPE_LEAF: u8 = 0;
-const PAGE_TYPE_INTERNAL: u8 = 1;
+pub(crate) const PAGE_TYPE_LEAF: u8 = 0;
+pub(crate) const PAGE_TYPE_INTERNAL: u8 = 1;
 
 impl BTreeNode {
     pub fn page_id(&self) -> PageId {

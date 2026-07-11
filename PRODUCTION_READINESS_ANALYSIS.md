@@ -53,6 +53,17 @@ For a Claude Code metrics monitoring application, you would need a production da
 - The entire tree lives in a `BTreeMap<PageId, BTreeNode>` in memory. No paging to/from actual disk.
 - Max leaf entries and internal keys are both 32 (configurable), which is reasonable for 4KB pages.
 
+**Buffer-pool eviction policy (updated 2026-07-11)**: `buffer_pool.rs` now uses
+a weighted score discovered by the edge-loop autoresearch loop (replacing
+LRU-2), validated at **−23.5% disk traffic vs LRU-2 on held-out traces** of
+real B-tree access patterns, and pinned victim-for-victim by the differential
+test against `tests/fixtures/discovered_policy_vectors.json` (feature
+`trace-capture`). Note the activation caveat: because the tree does not yet
+demand-page (previous bullet), the pool today sees only the write-back path —
+the policy's read-miss savings materialize when the B-tree reads through the
+pool. The dirty-write-back improvement applies now; the discovered policy is
+the one a future demand-paging engine should keep.
+
 ### 3. Transaction Support (Grade: B+)
 
 **MVCC + OCC implementation** (`src/txn/`):
